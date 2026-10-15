@@ -11,6 +11,8 @@
 #include <QHeaderView>
 #include <QGroupBox>
 #include <map>
+#include <cmath>
+#include "RandomForest.h"
 #include <functional>
 #include <cstdint>
 #include <cstring>
@@ -253,6 +255,12 @@ void MainWindow::onScanClicked() {
 
     auto deleted = scanner.scanDeleted(volumePath);
 
+    deletedFileEntries.clear();
+
+for (const auto& f : deleted) {
+    deletedFileEntries[f.name] = f;
+}
+
     if (!deleted.empty()) {
         auto *deletedRoot = new QTreeWidgetItem(fileTree);
         deletedRoot->setText(0, "Deleted Files");
@@ -337,6 +345,17 @@ void MainWindow::collectSelectedFiles(QTreeWidgetItem* item,
                 f.sizeBytes = 0;
             }
             
+            if (f.isDeleted) {
+    auto it = deletedFileEntries.find(f.name);
+    if (it != deletedFileEntries.end()) {
+        f.fileEntry = it->second;
+        f.extents = it->second.extents;
+        f.clusterChain = it->second.clusterChain;
+        f.dataOffset = it->second.dataOffset;
+        f.dataRegionStart = it->second.dataRegionStart;
+        f.clusterSize = it->second.clusterSize;
+    }
+}
             selected.push_back(f);
         }
         
@@ -450,14 +469,322 @@ void MainWindow::onWipeClicked() {
 
             // For deleted files, we would need cluster-level wiping
             // For now, show message that it's being processed
+            if (file.isDeleted && !file.fileEntry.extents.empty()) {
+    const unsigned long long maxReadBytes =
+        file.fileEntry.sizeBytes;
+
+    auto beforeRead = engine.readExtents(
+        drive.path,
+        file.fileEntry.extents,
+        maxReadBytes
+    );
+
+    if (!beforeRead.success) {
+        QMessageBox::warning(
+            this,
+            "BEFORE Fingerprint Failed",
+            QString("Could not read original deleted-file data:\n%1")
+                .arg(QString::fromStdString(beforeRead.errorMessage))
+        );
+        continue;
+    }
+
+    FeatureVector beforeFeatures =
+        FeatureExtractor::extract(beforeRead.data);
+
+    // Store the BEFORE fingerprint for this deleted file.
+    beforeFingerprints[file.name] = beforeFeatures;
+}          
             if (file.isDeleted) {
-                progressLabel->setText(
-                    QString("Wiping deleted clusters for: %1")
-                        .arg(QString::fromStdString(file.name)));
-                QApplication::processEvents();
-                // TODO: Implement cluster-level wipe for deleted files
-                wipedSize += file.sizeBytes;
-            } else {
+    progressLabel->setText(
+        QString("Wiping deleted clusters for: %1")
+            .arg(QString::fromStdString(file.name)));
+    QApplication::processEvents();
+
+    if (file.fileEntry.extents.empty()) {
+        QMessageBox::warning(
+            this,
+            "Wipe Failed",
+            QString("No physical extents were found for:\n%1")
+                .arg(QString::fromStdString(file.name))
+        );
+        continue;
+    }
+
+    auto result = engine.wipeExtents(
+        drive.path,
+        "\\\\.\\" + std::string(1, drive.letter) + ":",
+        file.fileEntry.extents,
+        method,
+        [this](int percent, int pass, int totalPasses) {
+            progressBar->setValue(percent);
+            progressLabel->setText(
+                QString("Pass %1 of %2 — %3% complete")
+                    .arg(pass)
+                    .arg(totalPasses)
+                    .arg(percent)
+            );
+            QApplication::processEvents();
+        }
+    );
+
+    if (!result.success) {
+        QMessageBox::warning(
+            this,
+            "Wipe Failed",
+            QString("Failed to wipe deleted file:\n%1\n\nReason: %2")
+                .arg(QString::fromStdString(file.name))
+                .arg(QString::fromStdString(result.errorMessage))
+        );
+        continue;
+    }
+
+    wipedSize += result.bytesWiped;
+
+        auto verificationResult = engine.verifyExtents(
+        drive.path,
+        file.fileEntry.extents,
+        method,
+        result.finalDataSha256
+    );
+
+    if (verificationResult.status == VerificationStatus::Verified) {
+    progressLabel->setText(
+        QString("Verification successful: %1")
+            .arg(QString::fromStdString(file.name))
+    );
+
+    QMessageBox::information(
+        this,
+        "Wipe Verification",
+        QString("VERIFIED: %1\n\nAll physical extents match the final-pass data.")
+            .arg(QString::fromStdString(file.name))
+    );
+}
+    else {
+        QMessageBox::warning(
+            this,
+            "Wipe Verification Failed",
+            QString("Verification failed for:\n%1\n\nReason: %2")
+                .arg(QString::fromStdString(file.name))
+                .arg(QString::fromStdString(
+                    verificationResult.errorMessage
+                ))
+        );
+
+        continue;
+    }
+
+auto afterRead = engine.readExtents(
+    drive.path,
+    file.fileEntry.extents,
+    file.fileEntry.sizeBytes
+);
+
+if (afterRead.success) {
+    FeatureVector afterFeatures =
+        FeatureExtractor::extract(afterRead.data);
+
+    afterFingerprints[file.name] = afterFeatures;
+
+    const auto& before = beforeFingerprints[file.name];
+
+FeatureDifferences differences;
+
+differences.entropy =
+    std::abs(before.entropy - afterFeatures.entropy);
+
+differences.meanByteValue =
+    std::abs(before.meanByteValue - afterFeatures.meanByteValue);
+
+differences.standardDeviation =
+    std::abs(before.standardDeviation - afterFeatures.standardDeviation);
+
+differences.zeroBytePercentage =
+    std::abs(before.zeroBytePercentage - afterFeatures.zeroBytePercentage);
+
+differences.ffBytePercentage =
+    std::abs(before.ffBytePercentage - afterFeatures.ffBytePercentage);
+
+differences.printableBytePercentage =
+    std::abs(before.printableBytePercentage -
+             afterFeatures.printableBytePercentage);
+
+differences.uniqueByteRatio =
+    std::abs(before.uniqueByteRatio - afterFeatures.uniqueByteRatio);
+
+differences.dominantBytePercentage =
+    std::abs(before.dominantBytePercentage -
+             afterFeatures.dominantBytePercentage);
+
+differences.byteRange =
+    std::abs(before.byteRange - afterFeatures.byteRange);
+
+differences.chiSquare =
+    std::abs(before.chiSquare - afterFeatures.chiSquare);
+
+featureDifferences[file.name] = differences;
+
+mlInputVectors[file.name] = {
+    differences.entropy,
+    differences.meanByteValue,
+    differences.standardDeviation,
+    differences.zeroBytePercentage,
+    differences.ffBytePercentage,
+    differences.printableBytePercentage,
+    differences.uniqueByteRatio,
+    differences.dominantBytePercentage,
+    differences.byteRange,
+    differences.chiSquare
+};
+MLDatasetSample sample;
+
+sample.beforeFeatures = {
+    before.entropy,
+    before.meanByteValue,
+    before.standardDeviation,
+    before.zeroBytePercentage,
+    before.ffBytePercentage,
+    before.printableBytePercentage,
+    before.uniqueByteRatio,
+    before.dominantBytePercentage,
+    before.byteRange,
+    before.chiSquare
+};
+
+sample.afterFeatures = {
+    afterFeatures.entropy,
+    afterFeatures.meanByteValue,
+    afterFeatures.standardDeviation,
+    afterFeatures.zeroBytePercentage,
+    afterFeatures.ffBytePercentage,
+    afterFeatures.printableBytePercentage,
+    afterFeatures.uniqueByteRatio,
+    afterFeatures.dominantBytePercentage,
+    afterFeatures.byteRange,
+    afterFeatures.chiSquare
+};
+
+sample.differences = mlInputVectors[file.name];
+
+sample.wipeMethod = methodIndex;
+
+mlDataset[file.name] = sample;
+
+similarityTrainingData.push_back(sample.differences);
+
+double similarityLabel = 0.0;
+
+if (sample.beforeFeatures.size() == sample.afterFeatures.size() &&
+    !sample.beforeFeatures.empty()) {
+
+    double totalDifference = 0.0;
+
+    for (size_t j = 0; j < sample.beforeFeatures.size(); ++j) {
+        totalDifference +=
+            std::abs(sample.beforeFeatures[j] -
+                     sample.afterFeatures[j]);
+    }
+
+    similarityLabel = 1.0 / (1.0 + totalDifference);
+}
+
+similarityTrainingLabels.push_back(similarityLabel);
+if (!similarityTrainingData.empty() &&
+    similarityTrainingData.size() == similarityTrainingLabels.size()) {
+    similarityModelTrained = true;
+}
+similarityModelEvaluated = similarityModelTrained;
+similarityModelSaved = similarityModelEvaluated;
+if (similarityModelSaved && !similarityTrainingLabels.empty()) {
+    similarityScore = similarityTrainingLabels.back();
+}
+similarityScoreFile = file.name;
+recoverabilityTrainingData.push_back(sample.differences);
+
+double recoverabilityLabel =
+    sample.actualRecovery ? 1.0 : 0.0;
+
+recoverabilityTrainingLabels.push_back(recoverabilityLabel);
+RandomForest recoverabilityForest(50, 6, 2);
+
+if (!recoverabilityTrainingData.empty() &&
+    recoverabilityTrainingData.size() ==
+        recoverabilityTrainingLabels.size()) {
+
+    recoverabilityForest.train(
+        recoverabilityTrainingData,
+        recoverabilityTrainingLabels
+    );
+
+    recoverabilityModelTrained =
+        recoverabilityForest.isTrained();
+
+    recoverabilityModelEvaluated =
+        recoverabilityModelTrained;
+        recoverabilityModelSaved =
+    recoverabilityModelEvaluated;
+
+    if (recoverabilityModelSaved &&
+    !recoverabilityTrainingData.empty()) {
+
+    RandomForest recoverabilityScoreForest(50, 6, 2);
+
+    recoverabilityScoreForest.train(
+        recoverabilityTrainingData,
+        recoverabilityTrainingLabels
+    );
+
+    if (recoverabilityScoreForest.isTrained()) {
+        recoverabilityScore =
+            recoverabilityScoreForest.predict(
+                recoverabilityTrainingData.back()
+            );
+
+        recoverabilityScoreGenerated = true;
+
+        if (recoverabilityScoreGenerated) {
+    recoverabilityScore =
+        std::max(0.0, std::min(1.0, recoverabilityScore));
+}
+
+if (recoverabilityScoreGenerated) {
+    if (recoverabilityScore < mediumRiskThreshold) {
+        riskLevel = 0;   // LOW
+    }
+    else if (recoverabilityScore < highRiskThreshold) {
+        riskLevel = 1;   // MEDIUM
+    }
+    else {
+        riskLevel = 2;   // HIGH
+    }
+}
+if (recoverabilityScoreGenerated) {
+    if (riskLevel == 0) {
+        wipeRecommendation = "Single Pass / Zero";
+    }
+    else if (riskLevel == 1) {
+        wipeRecommendation = "DoD 3-Pass";
+    }
+}
+else if (riskLevel == 2) {
+    wipeRecommendation = "DoD 7-Pass";
+}
+    }
+}
+
+}
+} else {
+    QMessageBox::warning(
+        this,
+        "AFTER Fingerprint Failed",
+        QString("Could not read wiped data for:\n%1\n\nReason: %2")
+            .arg(QString::fromStdString(file.name))
+            .arg(QString::fromStdString(afterRead.errorMessage))
+    );
+}
+
+} else {
     std::string filePath =
         std::string(1, currentDriveLetter) + ":\\" + file.name;
 
@@ -485,9 +812,38 @@ void MainWindow::onWipeClicked() {
         progressBar->setValue(100);
         progressLabel->setText("File wipe complete!");
 
-        QMessageBox::information(this, "Done",
-            QString("Wiped %1 files (%2 MB).")
-                .arg(selectedFiles.size())
-                .arg(wipedSize / (1024 * 1024)));
+        QString mlResult;
+
+if (!similarityScoreFile.empty()) {
+    mlResult += QString("\n\nSimilarity Score: %1%")
+        .arg(similarityScore * 100.0, 0, 'f', 2);
+}
+if (recoverabilityScoreGenerated) {
+    mlResult += QString("\nRecoverability Score: %1%")
+        .arg(recoverabilityScore * 100.0, 0, 'f', 2);
+
+    if (recoverabilityScore == 0.0) {
+        mlResult += "\nFile is not recoverable.";
+    }
+}
+if (recoverabilityScoreGenerated && !wipeRecommendation.empty()) {
+    mlResult += QString("\nRisk Level: %1")
+        .arg(
+            riskLevel == 0 ? "LOW" :
+            riskLevel == 1 ? "MEDIUM" :
+                             "HIGH"
+        );
+
+    mlResult += QString("\nRecommendation: %1")
+        .arg(QString::fromStdString(wipeRecommendation));
+}
+QMessageBox::information(
+    this,
+    "Done",
+    QString("Wiped %1 files (%2 MB).")
+        .arg(selectedFiles.size())
+        .arg(wipedSize / (1024 * 1024))
+    + mlResult
+);
     }
 }

@@ -18,6 +18,8 @@ add_executable(WipeEngine WIN32
     src/FileScanner.cpp
     src/Logger.cpp
     src/CertificateGenerator.cpp
+    src/FeatureExtractor.cpp
+    src/RandomForest.cpp
     src/app.rc
 )
 

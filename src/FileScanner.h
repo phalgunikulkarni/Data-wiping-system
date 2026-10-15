@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 enum class FileStatus {
@@ -16,6 +17,15 @@ struct FileEntry {
     std::string lastModified;
     FileStatus status;
     bool isDirectory;
+    bool isValid = true;
+
+    uint32_t startCluster = 0;
+    uint64_t dataOffset = 0;
+    uint64_t dataRegionStart = 0;
+    uint64_t clusterSize = 0;
+    std::vector<uint32_t> clusterChain;
+    std::vector<uint32_t> clusters;
+    std::vector<std::pair<uint64_t, uint64_t>> extents;
 };
 
 class FileScanner {

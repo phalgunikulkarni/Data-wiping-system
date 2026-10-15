@@ -2,9 +2,12 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <utility>
 #include <functional>
 #include <QString>
 #include <QFile>
+
+class QCryptographicHash;
 
 enum class WipeMethod {
     ZEROS,
@@ -13,12 +16,40 @@ enum class WipeMethod {
     RANDOM
 };
 
+enum class WipeStatus {
+    Success,
+    PartialFailure,
+    InvalidExtent,
+    OpenFailure,
+    LockFailure,
+    WriteFailure
+};
+
+enum class VerificationStatus {
+    Verified,
+    Failed,
+    Error
+};
+
+struct VerificationResult {
+    VerificationStatus status = VerificationStatus::Error;
+    std::string errorMessage;
+};
+
+struct ExtentReadResult {
+    bool success = false;
+    std::vector<unsigned char> data;
+    std::string errorMessage;
+};
+
 struct WipeResult {
     bool success;
     unsigned long long bytesWiped;
     unsigned long long totalBytes;
     std::string errorMessage;
+    std::string finalDataSha256;
     int passesCompleted;
+    WipeStatus status = WipeStatus::Success;
 };
 
 
@@ -40,9 +71,36 @@ public:
         std::function<void(int, int, int)> progressCallback
     );
 
+    WipeResult wipeExtents(
+    const std::string& physicalPath,
+    const std::string& volumePath,
+    const std::vector<std::pair<unsigned long long, unsigned long long>>& extents,
+    WipeMethod method,
+    std::function<void(int, int, int)> progressCallback
+);
+
+    VerificationResult verifyExtents(
+        const std::string& physicalPath,
+        const std::vector<std::pair<unsigned long long, unsigned long long>>& extents,
+        WipeMethod method,
+        const std::string& expectedFinalSha256
+    );
+
+    ExtentReadResult readExtents(
+        const std::string& physicalPath,
+        const std::vector<std::pair<unsigned long long, unsigned long long>>& extents,
+        unsigned long long maximumBytes
+    );
+
     WipeResult wipeFile(
     const QString& filePath,
     WipeMethod method
+    );
+
+    WipeResult wipeFile(
+    const QString& filePath,
+    WipeMethod method,
+    std::function<void(int, int, int)> progressCallback
     );
 
     WipeResult wipeFolder(
@@ -63,7 +121,8 @@ private:
         int passNumber,
         int totalPasses,
         std::function<void(int, int, int)> progressCallback,
-        unsigned long long startOffset = 0
+        unsigned long long startOffset = 0,
+        QCryptographicHash* finalPassHash = nullptr
     );
 
     bool verifyWipe(
