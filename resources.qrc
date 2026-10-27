@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/assets">
+        <file alias="cybersecurity_network_background.png">assets/cybersecurity_network_background.png</file>
+    </qresource>
+</RCC>

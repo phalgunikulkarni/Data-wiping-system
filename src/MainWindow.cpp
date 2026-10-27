@@ -1,849 +1,427 @@
 #include "MainWindow.h"
-#include "DeviceManager.h"
-#include "FileScanner.h"
-#include "WipeEngine.h"
-#include <QVBoxLayout>
+#include "ImageBackgroundWidget.h"
+
+#include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
-#include <QWidget>
-#include <QString>
+#include <QLabel>
 #include <QMessageBox>
-#include <QApplication>
-#include <QHeaderView>
-#include <QGroupBox>
-#include <map>
-#include <cmath>
-#include "RandomForest.h"
+#include <QPushButton>
+#include <QScrollArea>
+#include <QStackedWidget>
+#include <QStringList>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QWidget>
 #include <functional>
-#include <cstdint>
-#include <cstring>
-#include <windows.h>
 
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
-    auto *central    = new QWidget(this);
-    auto *mainLayout = new QVBoxLayout(central);
+namespace {
+const QString cardStyle = QStringLiteral(
+    "QFrame#contentCard { background-color:rgba(5,18,43,226); border:1px solid rgba(122,177,211,75); border-radius:14px; }"
+    "QFrame#quickCard { background-color:rgba(5,18,43,226); border:1px solid rgba(122,177,211,75); border-radius:12px; }");
 
-    // ── Title ──
-    statusLabel = new QLabel("Secure Data Wipe Tool", this);
-    statusLabel->setAlignment(Qt::AlignCenter);
-    statusLabel->setStyleSheet(
-        "font-size: 20px; font-weight: bold;"
-        "padding: 10px; color: #00cfff;");
+QLabel* heading(const QString& text, QWidget* parent = nullptr)
+{
+    auto* label = new QLabel(text, parent);
+    label->setStyleSheet(QStringLiteral("color:#f4f8ff; font-size:18px; font-weight:700;"));
+    return label;
+}
 
-    // ── Device group ──
-    auto *deviceGroup  = new QGroupBox("Device Detection", this);
-    auto *deviceLayout = new QVBoxLayout(deviceGroup);
+QLabel* bodyText(const QString& text, QWidget* parent = nullptr)
+{
+    auto* label = new QLabel(text, parent);
+    label->setWordWrap(true);
+    label->setStyleSheet(QStringLiteral("color:#b5c5d9; font-size:13px;"));
+    return label;
+}
 
-    refreshButton = new QPushButton("Detect USB Devices", this);
-    driveList     = new QListWidget(this);
-    driveList->setMaximumHeight(100);
+QFrame* makeCard(QWidget* parent = nullptr)
+{
+    auto* frame = new QFrame(parent);
+    frame->setObjectName(QStringLiteral("contentCard"));
+    frame->setStyleSheet(cardStyle);
+    return frame;
+}
 
-    deviceLayout->addWidget(refreshButton);
-    deviceLayout->addWidget(driveList);
+QPushButton* linkButton(const QString& text, QWidget* parent = nullptr)
+{
+    auto* button = new QPushButton(text, parent);
+    button->setCursor(Qt::PointingHandCursor);
+    button->setStyleSheet(QStringLiteral(
+        "QPushButton { color:#6bd7f5; background:transparent; border:0; padding:6px 2px; font-weight:700; text-align:left; }"
+        "QPushButton:hover { color:#b6f1ff; } QPushButton:focus { border:1px solid #56c9eb; border-radius:4px; }"));
+    return button;
+}
 
-    // ── File scan group ──
-    auto *scanGroup  = new QGroupBox("File Scanner", this);
-    auto *scanLayout = new QVBoxLayout(scanGroup);
+QWidget* quickActionCard(const QString& glyph, const QString& title, const QString& description,
+                         const std::function<void()>& onClick, QWidget* parent)
+{
+    auto* frame = new QFrame(parent);
+    frame->setObjectName(QStringLiteral("quickCard"));
+    frame->setStyleSheet(cardStyle);
+    auto* layout = new QVBoxLayout(frame);
+    layout->setContentsMargins(16,14,16,12);
+    layout->setSpacing(8);
+    auto* icon = new QLabel(glyph, frame);
+    icon->setStyleSheet(QStringLiteral("color:#6bd7f5; font-size:21px; font-weight:700;"));
+    auto* titleLabel = heading(title, frame);
+    titleLabel->setStyleSheet(QStringLiteral("color:#f4f8ff; font-size:15px; font-weight:700;"));
+    auto* descriptionLabel = bodyText(description, frame);
+    auto* status = new QLabel(QStringLiteral("NOT AVAILABLE YET"), frame);
+    status->setStyleSheet(QStringLiteral("color:#ff9daf; font-size:10px; letter-spacing:1px; font-weight:700;"));
+    auto* button = linkButton(QStringLiteral("Details  ›"), frame);
+    QObject::connect(button, &QPushButton::clicked, frame, [onClick]() { onClick(); });
+    layout->addWidget(icon);
+    layout->addWidget(titleLabel);
+    layout->addWidget(descriptionLabel, 1);
+    layout->addWidget(status);
+    layout->addWidget(button);
+    return frame;
+}
 
-    auto *scanTopLayout = new QHBoxLayout();
-    scanButton       = new QPushButton("Scan Selected Drive", this);
-    showDeletedCheck = new QCheckBox("Show Deleted Files", this);
-    showDeletedCheck->setChecked(true);
-    scanTopLayout->addWidget(scanButton);
-    scanTopLayout->addWidget(showDeletedCheck);
-    scanTopLayout->addStretch();
+QWidget* scrollPage(QWidget* content)
+{
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scroll->setStyleSheet(QStringLiteral("QScrollArea { background:transparent; } QScrollArea > QWidget > QWidget { background:transparent; } QScrollBar:vertical { background:rgba(4,16,42,130); width:9px; margin:2px; } QScrollBar::handle:vertical { background:#477b9e; border-radius:4px; min-height:24px; }"));
+    scroll->setWidget(content);
+    return scroll;
+}
+}
 
-    scanStatusLabel = new QLabel("Select a drive and click Scan.", this);
-    scanStatusLabel->setStyleSheet("color: #aaaaaa; font-size: 12px;");
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
+{
+    setWindowTitle(QStringLiteral("DataGuard — Secure. Recover. Verify."));
+    setMinimumSize(960, 640);
+    resize(1240, 820);
 
-    fileTree = new QTreeWidget(this);
-    fileTree->setHeaderLabels({"Name", "Size", "Status", "Modified"});
-    fileTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    fileTree->setMinimumHeight(250);
-    fileTree->setStyleSheet("font-size: 12px;");
+    auto* background = new ImageBackgroundWidget(this);
+    auto* shell = new QHBoxLayout(background);
+    shell->setContentsMargins(18,18,18,18);
+    shell->setSpacing(14);
 
-    scanLayout->addLayout(scanTopLayout);
-    scanLayout->addWidget(scanStatusLabel);
-    scanLayout->addWidget(fileTree);
+    auto* sidebar = new QFrame(background);
+    sidebar->setObjectName(QStringLiteral("sidebar"));
+    sidebar->setFixedWidth(218);
+    sidebar->setStyleSheet(QStringLiteral("QFrame#sidebar { background-color:rgba(4,15,38,232); border:1px solid rgba(122,177,211,65); border-radius:16px; }"));
+    auto* sideLayout = new QVBoxLayout(sidebar);
+    sideLayout->setContentsMargins(14,18,14,16);
+    sideLayout->setSpacing(8);
 
-    // ── Wipe group ──
-    auto *wipeGroup  = new QGroupBox("Secure Wipe", this);
-    auto *wipeLayout = new QVBoxLayout(wipeGroup);
+    auto* brand = new QLabel(QStringLiteral("◈  DataGuard"), sidebar);
+    brand->setStyleSheet(QStringLiteral("color:#f6f9ff; font-size:19px; font-weight:800; padding:4px 6px;"));
+    auto* tagline = new QLabel(QStringLiteral("SECURE. RECOVER. VERIFY."), sidebar);
+    tagline->setStyleSheet(QStringLiteral("color:#7795b3; font-size:9px; letter-spacing:1px; padding:0 8px 14px 8px;"));
+    sideLayout->addWidget(brand);
+    sideLayout->addWidget(tagline);
 
-    auto *methodLayout = new QHBoxLayout();
-    auto *methodLabel  = new QLabel("Wipe Method:", this);
-    wipeMethodCombo    = new QComboBox(this);
-    wipeMethodCombo->addItem("Single Pass - Zeros",      0);
-    wipeMethodCombo->addItem("DoD 3-Pass (Recommended)", 1);
-    wipeMethodCombo->addItem("DoD 7-Pass (Maximum)",     2);
-    wipeMethodCombo->setStyleSheet("padding: 5px;");
-    methodLayout->addWidget(methodLabel);
-    methodLayout->addWidget(wipeMethodCombo);
-    methodLayout->addStretch();
+    const QStringList navNames = {QStringLiteral("Dashboard"), QStringLiteral("Devices"), QStringLiteral("Scan Results"), QStringLiteral("Operations"), QStringLiteral("Activity Log"), QStringLiteral("Certificates"), QStringLiteral("Assistant"), QStringLiteral("Settings")};
+    const QStringList navIcons = {QStringLiteral("⌂"), QStringLiteral("▣"), QStringLiteral("⌕"), QStringLiteral("↻"), QStringLiteral("◷"), QStringLiteral("▤"), QStringLiteral("✦"), QStringLiteral("⚙")};
+    for (int index = 0; index < navNames.size(); ++index) {
+        auto* button = new QToolButton(sidebar);
+        button->setText(navIcons[index] + QStringLiteral("   ") + navNames[index]);
+        button->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        button->setCheckable(true);
+        button->setAutoExclusive(true);
+        button->setMinimumHeight(42);
+        button->setCursor(Qt::PointingHandCursor);
+        button->setStyleSheet(QStringLiteral(
+            "QToolButton { color:#b5c5d9; background:transparent; border:1px solid transparent; border-radius:9px; text-align:left; padding:0 11px; font-size:13px; }"
+            "QToolButton:hover { color:#ffffff; background:rgba(43,86,124,125); }"
+            "QToolButton:checked { color:#eafaff; background:rgba(21,119,171,145); border-left:3px solid #65d9f7; font-weight:700; }"
+            "QToolButton:focus { border:1px solid #65d9f7; }"));
+        sideLayout->addWidget(button);
+        m_navigationButtons.push_back(button);
+        connect(button, &QToolButton::clicked, this, [this,index,navNames]() { navigateTo(index, navNames[index]); });
+    }
+    sideLayout->addStretch();
+    auto* sideFooter = new QLabel(QStringLiteral("LOCAL ACCOUNT  •  SQLITE"), sidebar);
+    sideFooter->setStyleSheet(QStringLiteral("color:#6886a3; font-size:9px; letter-spacing:1px; padding:7px;"));
+    sideLayout->addWidget(sideFooter);
+    shell->addWidget(sidebar);
 
-    wipeButton = new QPushButton("START WIPE", this);
-    wipeButton->setEnabled(false);
-    wipeButton->setStyleSheet(
-        "padding: 10px; font-size: 14px; font-weight: bold;"
-        "background-color: #c0392b; color: white; border-radius: 4px;");
+    auto* right = new QWidget(background);
+    right->setStyleSheet(QStringLiteral("background:transparent;"));
+    auto* rightLayout = new QVBoxLayout(right);
+    rightLayout->setContentsMargins(0,0,0,0);
+    rightLayout->setSpacing(12);
 
-    progressBar = new QProgressBar(this);
-    progressBar->setRange(0, 100);
-    progressBar->setValue(0);
+    auto* header = new QFrame(right);
+    header->setObjectName(QStringLiteral("header"));
+    header->setStyleSheet(QStringLiteral("QFrame#header { background-color:rgba(4,15,38,224); border:1px solid rgba(122,177,211,65); border-radius:14px; }"));
+    auto* headerLayout = new QHBoxLayout(header);
+    headerLayout->setContentsMargins(20,10,16,10);
+    m_pageTitle = new QLabel(QStringLiteral("Dashboard"), header);
+    m_pageTitle->setStyleSheet(QStringLiteral("color:#f4f8ff; font-size:20px; font-weight:700;"));
+    headerLayout->addWidget(m_pageTitle);
+    headerLayout->addStretch();
+    m_accountLabel = new QLabel(header);
+    m_accountLabel->setStyleSheet(QStringLiteral("color:#c6d5e8; font-size:12px; padding:0 8px;"));
+    headerLayout->addWidget(m_accountLabel);
+    auto* logout = new QPushButton(QStringLiteral("Sign Out"), header);
+    logout->setCursor(Qt::PointingHandCursor);
+    logout->setStyleSheet(QStringLiteral("QPushButton { color:#eaf5ff; background:rgba(44,73,105,170); border:1px solid rgba(148,186,216,90); border-radius:8px; padding:8px 13px; } QPushButton:hover { background:rgba(64,101,139,210); } QPushButton:focus { border:1px solid #65d9f7; }"));
+    connect(logout, &QPushButton::clicked, this, &MainWindow::signOut);
+    headerLayout->addWidget(logout);
+    rightLayout->addWidget(header);
 
-    progressLabel = new QLabel("Select a device and press START WIPE.", this);
-    progressLabel->setAlignment(Qt::AlignCenter);
-    progressLabel->setStyleSheet("color: #aaaaaa; font-size: 12px;");
+    m_pages = new QStackedWidget(right);
+    m_pages->setStyleSheet(QStringLiteral("QStackedWidget { background:transparent; }"));
+    m_pages->addWidget(buildDashboardPage());
+    m_pages->addWidget(buildDevicesPage());
+    m_pages->addWidget(buildPlaceholderPage(QStringLiteral("Scan Results"), QStringLiteral("No scan results are available yet. Connect a device and perform a supported scan when that feature is enabled."), QStringLiteral("⌕")));
+    m_pages->addWidget(buildOperationsPage());
+    m_pages->addWidget(buildPlaceholderPage(QStringLiteral("Activity Log"), QStringLiteral("No activity recorded yet. Completed operations will appear here when audit logging is integrated."), QStringLiteral("◷")));
+    m_pages->addWidget(buildPlaceholderPage(QStringLiteral("Certificates"), QStringLiteral("No certificates generated yet. Certificates will appear here once operation records and verification evidence are integrated."), QStringLiteral("▤")));
+    m_pages->addWidget(buildPlaceholderPage(QStringLiteral("DataGuard Assistant"), QStringLiteral("Your intelligent storage assistant will be available here in a future update."), QStringLiteral("✦")));
+    m_pages->addWidget(buildSettingsPage());
+    rightLayout->addWidget(m_pages, 1);
+    shell->addWidget(right, 1);
+    setCentralWidget(background);
+    m_navigationButtons[0]->setChecked(true);
+    setSignedInUser(QString());
+}
 
-    wipeLayout->addLayout(methodLayout);
-    wipeLayout->addWidget(wipeButton);
-    wipeLayout->addWidget(progressBar);
-    wipeLayout->addWidget(progressLabel);
+void MainWindow::setSignedInUser(const QString& username)
+{
+    m_signedInUser = username.trimmed();
+    m_accountLabel->setText(m_signedInUser.isEmpty() ? QStringLiteral("Signed out") : m_signedInUser);
+    m_welcomeLabel->setText(m_signedInUser.isEmpty() ? QStringLiteral("Welcome back!") : QStringLiteral("Welcome back, %1!").arg(m_signedInUser));
+    m_settingsUsername->setText(m_signedInUser.isEmpty() ? QStringLiteral("No active session") : m_signedInUser);
+}
 
-    // ── Assemble ──
-    mainLayout->addWidget(statusLabel);
-    mainLayout->addWidget(deviceGroup);
-    mainLayout->addWidget(scanGroup);
-    mainLayout->addWidget(wipeGroup);
-    mainLayout->setSpacing(10);
-    mainLayout->setContentsMargins(15, 15, 15, 15);
+void MainWindow::navigateTo(int pageIndex, const QString& title)
+{
+    if (pageIndex < 0 || pageIndex >= m_pages->count()) return;
+    m_pages->setCurrentIndex(pageIndex);
+    m_pageTitle->setText(title);
+}
 
-    setCentralWidget(central);
-    setWindowTitle("WipeEngine - Secure Data Erasure");
-    setMinimumSize(750, 750);
+void MainWindow::signOut()
+{
+    setSignedInUser(QString());
+    m_navigationButtons[0]->setChecked(true);
+    navigateTo(0, QStringLiteral("Dashboard"));
+    emit signOutRequested();
+}
 
-    // ── Connections ──
-    connect(refreshButton, &QPushButton::clicked,
-            this, &MainWindow::onRefreshClicked);
-    connect(scanButton, &QPushButton::clicked,
-            this, &MainWindow::onScanClicked);
-    connect(wipeButton, &QPushButton::clicked,
-            this, &MainWindow::onWipeClicked);
-    connect(showDeletedCheck, &QCheckBox::toggled,
-            this, &MainWindow::onToggleDeleted);
-    connect(fileTree, &QTreeWidget::itemChanged,
-            this, [this](QTreeWidgetItem* item, int col) {
-                if (col == 0) onFileChecked(item, col);
-            });
-    connect(driveList, &QListWidget::itemSelectionChanged, this, [this]() {
-        bool selected = driveList->currentRow() >= 0;
-        wipeButton->setEnabled(selected);
-        scanButton->setEnabled(selected);
+QWidget* MainWindow::buildDashboardPage()
+{
+    auto* content = new QWidget;
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(2,4,8,12);
+    layout->setSpacing(14);
+
+    auto* welcomeCard = makeCard(content);
+    auto* welcomeLayout = new QVBoxLayout(welcomeCard);
+    welcomeLayout->setContentsMargins(22,17,22,17);
+    welcomeLayout->setSpacing(6);
+    m_welcomeLabel = heading(QStringLiteral("Welcome back!"), welcomeCard);
+    m_welcomeLabel->setStyleSheet(QStringLiteral("color:#f4f8ff; font-size:23px; font-weight:700;"));
+    welcomeLayout->addWidget(m_welcomeLabel);
+    welcomeLayout->addWidget(bodyText(QStringLiteral("Manage your connected devices and data securely."), welcomeCard));
+    layout->addWidget(welcomeCard);
+
+    auto* summaryRow = new QHBoxLayout;
+    summaryRow->setSpacing(14);
+    auto* deviceCard = makeCard(content);
+    auto* deviceLayout = new QVBoxLayout(deviceCard);
+    deviceLayout->setContentsMargins(18,16,18,15);
+    auto* deviceTitle = heading(QStringLiteral("Device overview"), deviceCard);
+    deviceLayout->addWidget(deviceTitle);
+    auto* deviceState = bodyText(QStringLiteral("Device detection is not connected yet."), deviceCard);
+    deviceState->setStyleSheet(QStringLiteral("color:#e2edf8; font-size:14px; font-weight:600;"));
+    deviceLayout->addWidget(deviceState);
+    deviceLayout->addWidget(bodyText(QStringLiteral("No device selected  ·  Capacity and filesystem unavailable"), deviceCard));
+    deviceLayout->addStretch();
+    auto* devicesLink = linkButton(QStringLiteral("Connect Device  ›"), deviceCard);
+    connect(devicesLink, &QPushButton::clicked, this, [this]() { m_navigationButtons[1]->click(); });
+    deviceLayout->addWidget(devicesLink);
+    summaryRow->addWidget(deviceCard, 1);
+
+    auto* scanCard = makeCard(content);
+    auto* scanLayout = new QVBoxLayout(scanCard);
+    scanLayout->setContentsMargins(18,16,18,15);
+    scanLayout->addWidget(heading(QStringLiteral("Scan summary"), scanCard));
+    auto* scanEmpty = bodyText(QStringLiteral("No scan results yet."), scanCard);
+    scanEmpty->setStyleSheet(QStringLiteral("color:#e2edf8; font-size:14px; font-weight:600;"));
+    scanLayout->addWidget(scanEmpty);
+    scanLayout->addWidget(bodyText(QStringLiteral("A scan will only appear here after an authorized scan feature is available."), scanCard));
+    scanLayout->addStretch();
+    auto* scanLink = linkButton(QStringLiteral("View Scan Results  ›"), scanCard);
+    connect(scanLink, &QPushButton::clicked, this, [this]() { m_navigationButtons[2]->click(); });
+    scanLayout->addWidget(scanLink);
+    summaryRow->addWidget(scanCard, 1);
+    layout->addLayout(summaryRow);
+
+    auto* quickTitle = heading(QStringLiteral("Quick actions"), content);
+    layout->addWidget(quickTitle);
+    auto* quickGrid = new QGridLayout;
+    quickGrid->setSpacing(12);
+    const QString unavailableMessage = QStringLiteral("This operation will be available after the storage engine safety review.");
+    const auto showUnavailable = [this,unavailableMessage]() { QMessageBox::information(this, QStringLiteral("Not available yet"), unavailableMessage); };
+    quickGrid->addWidget(quickActionCard(QStringLiteral("▣"), QStringLiteral("Wipe Full Drive"), QStringLiteral("Securely erase a supported storage device."), showUnavailable, content),0,0);
+    quickGrid->addWidget(quickActionCard(QStringLiteral("⌕"), QStringLiteral("Wipe a File"), QStringLiteral("Erase a selected file where supported."), showUnavailable, content),0,1);
+    quickGrid->addWidget(quickActionCard(QStringLiteral("↗"), QStringLiteral("Recover a File"), QStringLiteral("Find and restore supported deleted files."), showUnavailable, content),1,0);
+    quickGrid->addWidget(quickActionCard(QStringLiteral("▤"), QStringLiteral("Recover a Drive"), QStringLiteral("Review recovery candidates from a device."), showUnavailable, content),1,1);
+    layout->addLayout(quickGrid);
+
+    auto* lowerRow = new QHBoxLayout;
+    lowerRow->setSpacing(14);
+    auto* activityCard = makeCard(content);
+    auto* activityLayout = new QVBoxLayout(activityCard);
+    activityLayout->setContentsMargins(18,15,18,14);
+    auto* activityHeader = new QHBoxLayout;
+    activityHeader->addWidget(heading(QStringLiteral("Recent activity"), activityCard));
+    activityHeader->addStretch();
+    auto* activityLink = linkButton(QStringLiteral("Activity Log  ›"), activityCard);
+    activityHeader->addWidget(activityLink);
+    activityLayout->addLayout(activityHeader);
+    activityLayout->addWidget(bodyText(QStringLiteral("No activity recorded yet."), activityCard));
+    connect(activityLink, &QPushButton::clicked, this, [this]() { m_navigationButtons[4]->click(); });
+    lowerRow->addWidget(activityCard, 2);
+
+    auto* certCard = makeCard(content);
+    auto* certLayout = new QVBoxLayout(certCard);
+    certLayout->setContentsMargins(18,15,18,14);
+    auto* certHeader = new QHBoxLayout;
+    certHeader->addWidget(heading(QStringLiteral("Certificates"), certCard));
+    certHeader->addStretch();
+    auto* certLink = linkButton(QStringLiteral("View  ›"), certCard);
+    certHeader->addWidget(certLink);
+    certLayout->addLayout(certHeader);
+    certLayout->addWidget(bodyText(QStringLiteral("No certificates generated yet."), certCard));
+    connect(certLink, &QPushButton::clicked, this, [this]() { m_navigationButtons[5]->click(); });
+    lowerRow->addWidget(certCard, 1);
+    layout->addLayout(lowerRow);
+
+    auto* assistantCard = makeCard(content);
+    auto* assistantLayout = new QHBoxLayout(assistantCard);
+    assistantLayout->setContentsMargins(18,12,18,12);
+    assistantLayout->addWidget(heading(QStringLiteral("✦  DataGuard Assistant"), assistantCard));
+    assistantLayout->addWidget(bodyText(QStringLiteral("Guidance and explanations will be available in a future update."), assistantCard),1);
+    auto* assistantLink = linkButton(QStringLiteral("Open Assistant  ›"), assistantCard);
+    assistantLayout->addWidget(assistantLink);
+    connect(assistantLink, &QPushButton::clicked, this, [this]() { m_navigationButtons[6]->click(); });
+    layout->addWidget(assistantCard);
+    layout->addStretch();
+    return scrollPage(content);
+}
+
+QWidget* MainWindow::buildDevicesPage()
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(4,8,8,12);
+    layout->setSpacing(14);
+
+    auto* intro = makeCard(page);
+    auto* introLayout = new QVBoxLayout(intro);
+    introLayout->setContentsMargins(26,22,26,22);
+    introLayout->setSpacing(11);
+    auto* icon = new QLabel(QStringLiteral("▣"), intro);
+    icon->setAlignment(Qt::AlignCenter);
+    icon->setFixedSize(66,66);
+    icon->setStyleSheet(QStringLiteral("color:#70dcf7; background:rgba(27,94,135,100); border:1px solid rgba(112,220,247,95); border-radius:16px; font-size:34px;"));
+    introLayout->addWidget(icon,0,Qt::AlignHCenter);
+    auto* title = heading(QStringLiteral("Connect Your Device"), intro);
+    title->setStyleSheet(QStringLiteral("color:#f4f8ff; font-size:24px; font-weight:700;"));
+    introLayout->addWidget(title,0,Qt::AlignHCenter);
+    auto* description = bodyText(QStringLiteral("Connect a USB storage device to begin inspecting its details and scan results."), intro);
+    description->setAlignment(Qt::AlignCenter);
+    introLayout->addWidget(description);
+    auto* detect = new QPushButton(QStringLiteral("Scan for Devices"), intro);
+    detect->setMinimumHeight(44);
+    detect->setMaximumWidth(230);
+    detect->setCursor(Qt::PointingHandCursor);
+    detect->setStyleSheet(QStringLiteral("QPushButton { color:white; background:#1677c8; border:0; border-radius:9px; padding:10px 18px; font-weight:700; } QPushButton:hover { background:#2395dc; } QPushButton:focus { border:2px solid #72dafa; }"));
+    introLayout->addWidget(detect,0,Qt::AlignHCenter);
+    auto* note = bodyText(QStringLiteral("Device detection only identifies connected devices. It does not modify their contents."), intro);
+    note->setAlignment(Qt::AlignCenter);
+    note->setStyleSheet(QStringLiteral("color:#8fa7c1; font-size:11px;"));
+    introLayout->addWidget(note);
+    layout->addWidget(intro);
+
+    auto* listCard = makeCard(page);
+    auto* listLayout = new QVBoxLayout(listCard);
+    listLayout->setContentsMargins(20,16,20,16);
+    listLayout->addWidget(heading(QStringLiteral("Connected devices"), listCard));
+    auto* list = new QFrame(listCard);
+    list->setMinimumHeight(96);
+    list->setStyleSheet(QStringLiteral("QFrame { background:rgba(2,11,29,100); border:1px dashed rgba(140,179,211,90); border-radius:10px; }"));
+    auto* listBox = new QVBoxLayout(list);
+    auto* empty = bodyText(QStringLiteral("No devices listed. Device detection is not connected yet."), list);
+    empty->setAlignment(Qt::AlignCenter);
+    listBox->addWidget(empty);
+    listLayout->addWidget(list);
+    layout->addWidget(listCard);
+    layout->addStretch();
+
+    connect(detect, &QPushButton::clicked, page, [this]() {
+        QMessageBox::information(this, QStringLiteral("Device detection unavailable"), QStringLiteral("Device detection is not connected yet."));
     });
+    return page;
 }
 
-// ── Detect drives ──────────────────────────────────────────
-
-void MainWindow::onRefreshClicked() {
-    driveList->clear();
-    fileTree->clear();
-    wipeButton->setEnabled(false);
-    scanButton->setEnabled(false);
-    statusLabel->setText("Scanning ports...");
-
-    DeviceManager dm;
-    auto drives = dm.listRemovableDrives();
-
-    if (drives.empty()) {
-        driveList->addItem("No removable drives found.");
-        statusLabel->setText("No devices detected.");
-        return;
+QWidget* MainWindow::buildOperationsPage()
+{
+    auto* content = new QWidget;
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(4,8,8,12);
+    layout->setSpacing(14);
+    layout->addWidget(bodyText(QStringLiteral("Review the intended workflows. Storage operations are not enabled in this dashboard."), content));
+    auto* grid = new QGridLayout;
+    grid->setSpacing(12);
+    const QStringList titles = {QStringLiteral("Full-drive wiping"),QStringLiteral("Single-file wiping"),QStringLiteral("File recovery"),QStringLiteral("Drive recovery")};
+    const QStringList details = {
+        QStringLiteral("Erase a supported device after target validation and safety review."),
+        QStringLiteral("Securely erase an individual file where the storage technology permits."),
+        QStringLiteral("Search for supported deleted files and restore to a separate destination."),
+        QStringLiteral("Inspect a drive for recovery candidates and choose a separate destination.")};
+    for (int i=0;i<titles.size();++i) {
+        auto* card=makeCard(content); auto* box=new QVBoxLayout(card); box->setContentsMargins(18,16,18,16); box->setSpacing(9);
+        box->addWidget(heading(titles[i],card)); box->addWidget(bodyText(details[i],card),1);
+        auto* state=new QLabel(QStringLiteral("NOT AVAILABLE YET"),card); state->setStyleSheet(QStringLiteral("color:#ff9daf; font-size:10px; letter-spacing:1px; font-weight:700;")); box->addWidget(state);
+        grid->addWidget(card,i/2,i%2);
     }
-
-    for (auto &d : drives) {
-        QString entry = QString("[%1:\\]  %2  |  %3 MB  |  %4")
-            .arg(d.letter)
-            .arg(QString::fromStdString(d.model))
-            .arg(d.sizeBytes / (1024 * 1024))
-            .arg(QString::fromStdString(d.path));
-        driveList->addItem(entry);
-    }
-
-    statusLabel->setText(
-        QString("%1 device(s) detected. Select one.")
-            .arg(drives.size()));
+    layout->addLayout(grid); layout->addStretch();
+    return scrollPage(content);
 }
 
-// ── Scan files ─────────────────────────────────────────────
-
-void MainWindow::onScanClicked() {
-    int row = driveList->currentRow();
-    if (row < 0) return;
-
-    DeviceManager dm;
-    auto drives = dm.listRemovableDrives();
-    if (row >= (int)drives.size()) return;
-
-    auto &drive = drives[row];
-    fileTree->clear();
-    scanStatusLabel->setText("Scanning... please wait.");
-    QApplication::processEvents();
-
-    std::string root = std::string(1, drive.letter) + ":";
-    
-    // Store current drive info for wipe operation
-    currentDriveLetter = drive.letter;
-    currentDrivePath = drive.path;
-
-    // ── Root drive node ────────────────────────────────────
-    auto *rootItem = new QTreeWidgetItem(fileTree);
-    rootItem->setText(0, QString::fromStdString(root + "\\"));
-    rootItem->setText(2, "Drive Root");
-    rootItem->setForeground(0, QColor("#00cfff"));
-    rootItem->setExpanded(true);
-
-    // ── Recursive tree builder ─────────────────────────────
-    std::function<void(const std::string&, QTreeWidgetItem*)> buildTree;
-    buildTree = [&](const std::string& path, QTreeWidgetItem* parent) {
-        std::string searchPath = path + "\\*";
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
-        if (hFind == INVALID_HANDLE_VALUE) return;
-
-        do {
-            std::string name = fd.cFileName;
-            if (name == "." || name == "..") continue;
-
-            bool isDir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
-            std::string fullPath = path + "\\" + name;
-
-            auto *item = new QTreeWidgetItem(parent);
-            item->setText(0, QString::fromStdString(name));
-
-            if (isDir) {
-                item->setText(1, "—");
-                item->setText(2, "Folder");
-                item->setText(3, "—");
-                item->setForeground(0, QColor("#f0c040"));
-                item->setExpanded(false);
-                buildTree(fullPath, item);
-            } else {
-                ULARGE_INTEGER size;
-                size.LowPart  = fd.nFileSizeLow;
-                size.HighPart = fd.nFileSizeHigh;
-                item->setText(1, QString("%1 KB")
-                                  .arg(size.QuadPart / 1024));
-                item->setText(2, "Existing");
-                item->setText(3, "—");
-                item->setCheckState(0, Qt::Unchecked);
-            }
-
-        } while (FindNextFileA(hFind, &fd));
-
-        FindClose(hFind);
-    };
-
-    buildTree(root, rootItem);
-
-    // ── Count existing files ───────────────────────────────
-    int existingCount = 0;
-    std::function<void(QTreeWidgetItem*)> countItems;
-    countItems = [&](QTreeWidgetItem* item) {
-        for (int i = 0; i < item->childCount(); i++) {
-            auto *child = item->child(i);
-            if (child->text(2) == "Existing") existingCount++;
-            countItems(child);
-        }
-    };
-    countItems(rootItem);
-
-    // ── Deleted files node ─────────────────────────────────
-    int deletedCount = 0;
-
-    FileScanner scanner;
-    std::string volumePath =
-    "\\\\.\\" + std::string(1, drive.letter) + ":";
-
-    auto deleted = scanner.scanDeleted(volumePath);
-
-    deletedFileEntries.clear();
-
-for (const auto& f : deleted) {
-    deletedFileEntries[f.name] = f;
+QWidget* MainWindow::buildPlaceholderPage(const QString& headingText, const QString& message, const QString& glyph)
+{
+    auto* page=new QWidget;
+    auto* layout=new QVBoxLayout(page);
+    layout->setContentsMargins(4,8,8,12);
+    layout->addStretch();
+    auto* card=makeCard(page);
+    card->setMaximumWidth(680);
+    auto* box=new QVBoxLayout(card); box->setContentsMargins(32,32,32,32); box->setSpacing(14);
+    auto* icon=new QLabel(glyph,card); icon->setAlignment(Qt::AlignCenter); icon->setStyleSheet(QStringLiteral("color:#70dcf7; font-size:32px;")); box->addWidget(icon);
+    auto* title=heading(headingText,card); title->setAlignment(Qt::AlignCenter); title->setStyleSheet(QStringLiteral("color:#f4f8ff; font-size:24px; font-weight:700;")); box->addWidget(title);
+    auto* text=bodyText(message,card); text->setAlignment(Qt::AlignCenter); box->addWidget(text);
+    layout->addWidget(card,0,Qt::AlignHCenter);
+    layout->addStretch();
+    return page;
 }
 
-    if (!deleted.empty()) {
-        auto *deletedRoot = new QTreeWidgetItem(fileTree);
-        deletedRoot->setText(0, "Deleted Files");
-        deletedRoot->setText(2, "Recovered");
-        deletedRoot->setForeground(0, QColor("#e74c3c"));
-        deletedRoot->setExpanded(showDeletedCheck->isChecked());
-        deletedRoot->setHidden(!showDeletedCheck->isChecked());
-
-        for (auto &f : deleted) {
-            auto *item = new QTreeWidgetItem(deletedRoot);
-            item->setText(0, QString::fromStdString(f.name));
-            item->setText(1, QString("%1 KB").arg(f.sizeBytes / 1024));
-            item->setText(2, "DELETED");
-            item->setText(3, QString::fromStdString(f.lastModified));
-            item->setCheckState(0, Qt::Unchecked);
-            for (int col = 0; col < 4; col++)
-                item->setForeground(col, QColor("#e74c3c"));
-            deletedCount++;
-        }
-    }
-
-    scanStatusLabel->setText(
-        QString("Scan complete — %1 existing file(s), %2 deleted file(s) found.")
-            .arg(existingCount).arg(deletedCount));
-}
-
-// ── Toggle deleted visibility ──────────────────────────────
-
-void MainWindow::onToggleDeleted(bool show) {
-    for (int i = 0; i < fileTree->topLevelItemCount(); i++) {
-        auto *item = fileTree->topLevelItem(i);
-        if (item->text(2) == "Recovered") {
-            item->setHidden(!show);
-            item->setExpanded(show);
-        }
-    }
-}
-
-// ── Wipe ──────────────────────────────────────────────────
-
-void MainWindow::onFileChecked(QTreeWidgetItem* item, int column) {
-    // Update status when file selection changes
-    std::vector<FileToWipe> selected;
-    collectSelectedFiles(fileTree->invisibleRootItem(), selected);
-    
-    unsigned long long totalSize = 0;
-    for (auto& f : selected) totalSize += f.sizeBytes;
-    
-    if (selected.empty()) {
-        progressLabel->setText("Select files to wipe.");
-    } else {
-        progressLabel->setText(
-            QString("Selected: %1 file(s), %2 MB")
-                .arg(selected.size())
-                .arg(totalSize / (1024 * 1024)));
-    }
-}
-
-void MainWindow::collectSelectedFiles(QTreeWidgetItem* item, 
-                                     std::vector<FileToWipe>& selected) {
-    if (!item) return;
-    
-    for (int i = 0; i < item->childCount(); i++) {
-        auto* child = item->child(i);
-        
-        if (child->checkState(0) == Qt::Checked && 
-            child->text(2) != "Folder" && 
-            child->text(0) != "Deleted Files") {
-            
-            FileToWipe f;
-            f.name = child->text(0).toStdString();
-            f.isDeleted = (child->text(2) == "DELETED");
-            f.isDirectory = (child->text(2) == "Folder");
-            
-            // Extract size
-            QString sizeStr = child->text(1);
-            if (sizeStr.contains("KB")) {
-                f.sizeBytes = sizeStr.split(" ").first().toLongLong() * 1024;
-            } else if (sizeStr.contains("MB")) {
-                f.sizeBytes = sizeStr.split(" ").first().toLongLong() * 1024 * 1024;
-            } else {
-                f.sizeBytes = 0;
-            }
-            
-            if (f.isDeleted) {
-    auto it = deletedFileEntries.find(f.name);
-    if (it != deletedFileEntries.end()) {
-        f.fileEntry = it->second;
-        f.extents = it->second.extents;
-        f.clusterChain = it->second.clusterChain;
-        f.dataOffset = it->second.dataOffset;
-        f.dataRegionStart = it->second.dataRegionStart;
-        f.clusterSize = it->second.clusterSize;
-    }
-}
-            selected.push_back(f);
-        }
-        
-        // Recursively check children
-        collectSelectedFiles(child, selected);
-    }
-}
-
-void MainWindow::onWipeClicked() {
-    int row = driveList->currentRow();
-    if (row < 0) return;
-
-    DeviceManager dm;
-    auto drives = dm.listRemovableDrives();
-    if (row >= (int)drives.size()) return;
-    auto &drive = drives[row];
-
-    // Collect selected files
-    std::vector<FileToWipe> selectedFiles;
-    collectSelectedFiles(fileTree->invisibleRootItem(), selectedFiles);
-    
-    // If no files selected, ask for confirmation to wipe entire drive
-    if (selectedFiles.empty()) {
-        auto reply = QMessageBox::warning(this,
-            "CONFIRM FULL DRIVE WIPE",
-            QString("No files selected.\n\n"
-                    "Do you want to:\n"
-                    "[Yes] Wipe ENTIRE DRIVE %1:\\\n"
-                    "[No] Cancel and select files")
-                .arg(drive.letter),
-            QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No);
-
-        if (reply != QMessageBox::Yes) return;
-
-        // Wipe entire drive
-        wipeButton->setEnabled(false);
-        refreshButton->setEnabled(false);
-        progressBar->setValue(0);
-
-        int methodIndex = wipeMethodCombo->currentIndex();
-        WipeMethod method = (methodIndex == 0) ? WipeMethod::ZEROS
-                          : (methodIndex == 1) ? WipeMethod::DOD_3PASS
-                                               : WipeMethod::DOD_7PASS;
-
-        WipeEngine engine;
-        auto result = engine.wipe(
-            drive.path, drive.sizeBytes, method,
-            [this](int percent, int pass, int totalPasses) {
-                progressBar->setValue(percent);
-                progressLabel->setText(
-                    QString("Pass %1 of %2 — %3% complete")
-                        .arg(pass).arg(totalPasses).arg(percent));
-                QApplication::processEvents();
-            });
-
-        wipeButton->setEnabled(true);
-        refreshButton->setEnabled(true);
-
-        if (result.success) {
-            progressBar->setValue(100);
-            progressLabel->setText("Wipe complete!");
-            QMessageBox::information(this, "Done",
-                QString("Full drive wipe completed.\n%1 MB wiped.")
-                    .arg(result.bytesWiped / (1024 * 1024)));
-        } else {
-            progressLabel->setText("Wipe failed.");
-            QMessageBox::critical(this, "Error",
-                QString("Wipe failed: %1")
-                    .arg(QString::fromStdString(result.errorMessage)));
-        }
-    } else {
-        // Wipe selected files
-        unsigned long long totalSize = 0;
-        for (auto& f : selectedFiles) totalSize += f.sizeBytes;
-        
-        auto reply = QMessageBox::warning(this,
-            "CONFIRM FILE WIPE",
-            QString("You are about to securely wipe:\n\n"
-                    "%1 file(s) (%2 MB)\n\n"
-                    "ALL DATA WILL BE PERMANENTLY DESTROYED.\n"
-                    "This cannot be undone.\n\n"
-                    "Are you absolutely sure?")
-                .arg(selectedFiles.size())
-                .arg(totalSize / (1024 * 1024)),
-            QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No);
-
-        if (reply != QMessageBox::Yes) return;
-
-        wipeButton->setEnabled(false);
-        refreshButton->setEnabled(false);
-        progressBar->setValue(0);
-
-        int methodIndex = wipeMethodCombo->currentIndex();
-        WipeMethod method = (methodIndex == 0) ? WipeMethod::ZEROS
-                          : (methodIndex == 1) ? WipeMethod::DOD_3PASS
-                                               : WipeMethod::DOD_7PASS;
-
-        WipeEngine engine;
-        unsigned long long wipedSize = 0;
-
-        for (size_t i = 0; i < selectedFiles.size(); i++) {
-            auto& file = selectedFiles[i];
-            
-            progressLabel->setText(
-                QString("Wiping file %1 of %2: %3")
-                    .arg(i + 1).arg(selectedFiles.size())
-                    .arg(QString::fromStdString(file.name)));
-            QApplication::processEvents();
-
-            // For deleted files, we would need cluster-level wiping
-            // For now, show message that it's being processed
-            if (file.isDeleted && !file.fileEntry.extents.empty()) {
-    const unsigned long long maxReadBytes =
-        file.fileEntry.sizeBytes;
-
-    auto beforeRead = engine.readExtents(
-        drive.path,
-        file.fileEntry.extents,
-        maxReadBytes
-    );
-
-    if (!beforeRead.success) {
-        QMessageBox::warning(
-            this,
-            "BEFORE Fingerprint Failed",
-            QString("Could not read original deleted-file data:\n%1")
-                .arg(QString::fromStdString(beforeRead.errorMessage))
-        );
-        continue;
-    }
-
-    FeatureVector beforeFeatures =
-        FeatureExtractor::extract(beforeRead.data);
-
-    // Store the BEFORE fingerprint for this deleted file.
-    beforeFingerprints[file.name] = beforeFeatures;
-}          
-            if (file.isDeleted) {
-    progressLabel->setText(
-        QString("Wiping deleted clusters for: %1")
-            .arg(QString::fromStdString(file.name)));
-    QApplication::processEvents();
-
-    if (file.fileEntry.extents.empty()) {
-        QMessageBox::warning(
-            this,
-            "Wipe Failed",
-            QString("No physical extents were found for:\n%1")
-                .arg(QString::fromStdString(file.name))
-        );
-        continue;
-    }
-
-    auto result = engine.wipeExtents(
-        drive.path,
-        "\\\\.\\" + std::string(1, drive.letter) + ":",
-        file.fileEntry.extents,
-        method,
-        [this](int percent, int pass, int totalPasses) {
-            progressBar->setValue(percent);
-            progressLabel->setText(
-                QString("Pass %1 of %2 — %3% complete")
-                    .arg(pass)
-                    .arg(totalPasses)
-                    .arg(percent)
-            );
-            QApplication::processEvents();
-        }
-    );
-
-    if (!result.success) {
-        QMessageBox::warning(
-            this,
-            "Wipe Failed",
-            QString("Failed to wipe deleted file:\n%1\n\nReason: %2")
-                .arg(QString::fromStdString(file.name))
-                .arg(QString::fromStdString(result.errorMessage))
-        );
-        continue;
-    }
-
-    wipedSize += result.bytesWiped;
-
-        auto verificationResult = engine.verifyExtents(
-        drive.path,
-        file.fileEntry.extents,
-        method,
-        result.finalDataSha256
-    );
-
-    if (verificationResult.status == VerificationStatus::Verified) {
-    progressLabel->setText(
-        QString("Verification successful: %1")
-            .arg(QString::fromStdString(file.name))
-    );
-
-    QMessageBox::information(
-        this,
-        "Wipe Verification",
-        QString("VERIFIED: %1\n\nAll physical extents match the final-pass data.")
-            .arg(QString::fromStdString(file.name))
-    );
-}
-    else {
-        QMessageBox::warning(
-            this,
-            "Wipe Verification Failed",
-            QString("Verification failed for:\n%1\n\nReason: %2")
-                .arg(QString::fromStdString(file.name))
-                .arg(QString::fromStdString(
-                    verificationResult.errorMessage
-                ))
-        );
-
-        continue;
-    }
-
-auto afterRead = engine.readExtents(
-    drive.path,
-    file.fileEntry.extents,
-    file.fileEntry.sizeBytes
-);
-
-if (afterRead.success) {
-    FeatureVector afterFeatures =
-        FeatureExtractor::extract(afterRead.data);
-
-    afterFingerprints[file.name] = afterFeatures;
-
-    const auto& before = beforeFingerprints[file.name];
-
-FeatureDifferences differences;
-
-differences.entropy =
-    std::abs(before.entropy - afterFeatures.entropy);
-
-differences.meanByteValue =
-    std::abs(before.meanByteValue - afterFeatures.meanByteValue);
-
-differences.standardDeviation =
-    std::abs(before.standardDeviation - afterFeatures.standardDeviation);
-
-differences.zeroBytePercentage =
-    std::abs(before.zeroBytePercentage - afterFeatures.zeroBytePercentage);
-
-differences.ffBytePercentage =
-    std::abs(before.ffBytePercentage - afterFeatures.ffBytePercentage);
-
-differences.printableBytePercentage =
-    std::abs(before.printableBytePercentage -
-             afterFeatures.printableBytePercentage);
-
-differences.uniqueByteRatio =
-    std::abs(before.uniqueByteRatio - afterFeatures.uniqueByteRatio);
-
-differences.dominantBytePercentage =
-    std::abs(before.dominantBytePercentage -
-             afterFeatures.dominantBytePercentage);
-
-differences.byteRange =
-    std::abs(before.byteRange - afterFeatures.byteRange);
-
-differences.chiSquare =
-    std::abs(before.chiSquare - afterFeatures.chiSquare);
-
-featureDifferences[file.name] = differences;
-
-mlInputVectors[file.name] = {
-    differences.entropy,
-    differences.meanByteValue,
-    differences.standardDeviation,
-    differences.zeroBytePercentage,
-    differences.ffBytePercentage,
-    differences.printableBytePercentage,
-    differences.uniqueByteRatio,
-    differences.dominantBytePercentage,
-    differences.byteRange,
-    differences.chiSquare
-};
-MLDatasetSample sample;
-
-sample.beforeFeatures = {
-    before.entropy,
-    before.meanByteValue,
-    before.standardDeviation,
-    before.zeroBytePercentage,
-    before.ffBytePercentage,
-    before.printableBytePercentage,
-    before.uniqueByteRatio,
-    before.dominantBytePercentage,
-    before.byteRange,
-    before.chiSquare
-};
-
-sample.afterFeatures = {
-    afterFeatures.entropy,
-    afterFeatures.meanByteValue,
-    afterFeatures.standardDeviation,
-    afterFeatures.zeroBytePercentage,
-    afterFeatures.ffBytePercentage,
-    afterFeatures.printableBytePercentage,
-    afterFeatures.uniqueByteRatio,
-    afterFeatures.dominantBytePercentage,
-    afterFeatures.byteRange,
-    afterFeatures.chiSquare
-};
-
-sample.differences = mlInputVectors[file.name];
-
-sample.wipeMethod = methodIndex;
-
-mlDataset[file.name] = sample;
-
-similarityTrainingData.push_back(sample.differences);
-
-double similarityLabel = 0.0;
-
-if (sample.beforeFeatures.size() == sample.afterFeatures.size() &&
-    !sample.beforeFeatures.empty()) {
-
-    double totalDifference = 0.0;
-
-    for (size_t j = 0; j < sample.beforeFeatures.size(); ++j) {
-        totalDifference +=
-            std::abs(sample.beforeFeatures[j] -
-                     sample.afterFeatures[j]);
-    }
-
-    similarityLabel = 1.0 / (1.0 + totalDifference);
-}
-
-similarityTrainingLabels.push_back(similarityLabel);
-if (!similarityTrainingData.empty() &&
-    similarityTrainingData.size() == similarityTrainingLabels.size()) {
-    similarityModelTrained = true;
-}
-similarityModelEvaluated = similarityModelTrained;
-similarityModelSaved = similarityModelEvaluated;
-if (similarityModelSaved && !similarityTrainingLabels.empty()) {
-    similarityScore = similarityTrainingLabels.back();
-}
-similarityScoreFile = file.name;
-recoverabilityTrainingData.push_back(sample.differences);
-
-double recoverabilityLabel =
-    sample.actualRecovery ? 1.0 : 0.0;
-
-recoverabilityTrainingLabels.push_back(recoverabilityLabel);
-RandomForest recoverabilityForest(50, 6, 2);
-
-if (!recoverabilityTrainingData.empty() &&
-    recoverabilityTrainingData.size() ==
-        recoverabilityTrainingLabels.size()) {
-
-    recoverabilityForest.train(
-        recoverabilityTrainingData,
-        recoverabilityTrainingLabels
-    );
-
-    recoverabilityModelTrained =
-        recoverabilityForest.isTrained();
-
-    recoverabilityModelEvaluated =
-        recoverabilityModelTrained;
-        recoverabilityModelSaved =
-    recoverabilityModelEvaluated;
-
-    if (recoverabilityModelSaved &&
-    !recoverabilityTrainingData.empty()) {
-
-    RandomForest recoverabilityScoreForest(50, 6, 2);
-
-    recoverabilityScoreForest.train(
-        recoverabilityTrainingData,
-        recoverabilityTrainingLabels
-    );
-
-    if (recoverabilityScoreForest.isTrained()) {
-        recoverabilityScore =
-            recoverabilityScoreForest.predict(
-                recoverabilityTrainingData.back()
-            );
-
-        recoverabilityScoreGenerated = true;
-
-        if (recoverabilityScoreGenerated) {
-    recoverabilityScore =
-        std::max(0.0, std::min(1.0, recoverabilityScore));
-}
-
-if (recoverabilityScoreGenerated) {
-    if (recoverabilityScore < mediumRiskThreshold) {
-        riskLevel = 0;   // LOW
-    }
-    else if (recoverabilityScore < highRiskThreshold) {
-        riskLevel = 1;   // MEDIUM
-    }
-    else {
-        riskLevel = 2;   // HIGH
-    }
-}
-if (recoverabilityScoreGenerated) {
-    if (riskLevel == 0) {
-        wipeRecommendation = "Single Pass / Zero";
-    }
-    else if (riskLevel == 1) {
-        wipeRecommendation = "DoD 3-Pass";
-    }
-}
-else if (riskLevel == 2) {
-    wipeRecommendation = "DoD 7-Pass";
-}
-    }
-}
-
-}
-} else {
-    QMessageBox::warning(
-        this,
-        "AFTER Fingerprint Failed",
-        QString("Could not read wiped data for:\n%1\n\nReason: %2")
-            .arg(QString::fromStdString(file.name))
-            .arg(QString::fromStdString(afterRead.errorMessage))
-    );
-}
-
-} else {
-    std::string filePath =
-        std::string(1, currentDriveLetter) + ":\\" + file.name;
-
-    QString qFilePath = QString::fromStdString(filePath);
-
-    auto result = engine.wipeFile(qFilePath, method);
-
-    if (result.success) {
-        wipedSize += result.bytesWiped;
-    }
-    else {
-        QMessageBox::warning(
-            this,
-            "Wipe Failed",
-            QString("Failed to wipe:\n%1\n\nReason: %2")
-                .arg(qFilePath)
-                .arg(QString::fromStdString(result.errorMessage))
-        );
-    }
-}
-        }
-
-        wipeButton->setEnabled(true);
-        refreshButton->setEnabled(true);
-        progressBar->setValue(100);
-        progressLabel->setText("File wipe complete!");
-
-        QString mlResult;
-
-if (!similarityScoreFile.empty()) {
-    mlResult += QString("\n\nSimilarity Score: %1%")
-        .arg(similarityScore * 100.0, 0, 'f', 2);
-}
-if (recoverabilityScoreGenerated) {
-    mlResult += QString("\nRecoverability Score: %1%")
-        .arg(recoverabilityScore * 100.0, 0, 'f', 2);
-
-    if (recoverabilityScore == 0.0) {
-        mlResult += "\nFile is not recoverable.";
-    }
-}
-if (recoverabilityScoreGenerated && !wipeRecommendation.empty()) {
-    mlResult += QString("\nRisk Level: %1")
-        .arg(
-            riskLevel == 0 ? "LOW" :
-            riskLevel == 1 ? "MEDIUM" :
-                             "HIGH"
-        );
-
-    mlResult += QString("\nRecommendation: %1")
-        .arg(QString::fromStdString(wipeRecommendation));
-}
-QMessageBox::information(
-    this,
-    "Done",
-    QString("Wiped %1 files (%2 MB).")
-        .arg(selectedFiles.size())
-        .arg(wipedSize / (1024 * 1024))
-    + mlResult
-);
-    }
+QWidget* MainWindow::buildSettingsPage()
+{
+    auto* page=new QWidget;
+    auto* layout=new QVBoxLayout(page);
+    layout->setContentsMargins(4,8,8,12);
+    layout->setSpacing(14);
+    auto* account=makeCard(page);
+    auto* accountLayout=new QVBoxLayout(account); accountLayout->setContentsMargins(20,18,20,18); accountLayout->setSpacing(12);
+    accountLayout->addWidget(heading(QStringLiteral("Account"),account));
+    auto* nameRow=new QHBoxLayout(); nameRow->addWidget(bodyText(QStringLiteral("Signed-in username"),account)); nameRow->addStretch(); m_settingsUsername=new QLabel(account); m_settingsUsername->setStyleSheet(QStringLiteral("color:#edf6ff; font-weight:700;")); nameRow->addWidget(m_settingsUsername); accountLayout->addLayout(nameRow);
+    auto* dbRow=new QHBoxLayout(); dbRow->addWidget(bodyText(QStringLiteral("Persistence"),account)); dbRow->addStretch(); auto* dbMode=new QLabel(QStringLiteral("Local SQLite"),account); dbMode->setStyleSheet(QStringLiteral("color:#edf6ff; font-weight:700;")); dbRow->addWidget(dbMode); accountLayout->addLayout(dbRow);
+    layout->addWidget(account);
+    auto* about=makeCard(page); auto* aboutLayout=new QVBoxLayout(about); aboutLayout->setContentsMargins(20,18,20,18); aboutLayout->setSpacing(8);
+    aboutLayout->addWidget(heading(QStringLiteral("Application"),about)); aboutLayout->addWidget(bodyText(QStringLiteral("DataGuard desktop application\nSecure. Recover. Verify."),about)); layout->addWidget(about);
+    auto* logout=new QPushButton(QStringLiteral("Sign Out"),page); logout->setMaximumWidth(170); logout->setMinimumHeight(40); logout->setStyleSheet(QStringLiteral("QPushButton { color:white; background:#1677c8; border:0; border-radius:8px; font-weight:700; } QPushButton:hover { background:#2395dc; }")); connect(logout,&QPushButton::clicked,this,&MainWindow::signOut); layout->addWidget(logout,0,Qt::AlignLeft);
+    layout->addStretch();
+    return page;
 }
