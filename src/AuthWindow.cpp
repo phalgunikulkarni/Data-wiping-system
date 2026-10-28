@@ -2,6 +2,7 @@
 #include "ImageBackgroundWidget.h"
 
 #include <QApplication>
+#include <QGuiApplication>
 #include <QGraphicsDropShadowEffect>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -14,6 +15,14 @@
 #include <QWidget>
 
 namespace {
+class BusyCursorGuard {
+public:
+    BusyCursorGuard() { QGuiApplication::setOverrideCursor(Qt::WaitCursor); }
+    ~BusyCursorGuard() { QGuiApplication::restoreOverrideCursor(); }
+    BusyCursorGuard(const BusyCursorGuard&) = delete;
+    BusyCursorGuard& operator=(const BusyCursorGuard&) = delete;
+};
+
 QLineEdit* makeInput(const QString& placeholder, QWidget* parent, bool password = false) {
     auto* input = new QLineEdit(parent); input->setPlaceholderText(placeholder); input->setMinimumHeight(46);
     if (password) { input->setEchoMode(QLineEdit::Password); input->setClearButtonEnabled(false); }
@@ -93,10 +102,16 @@ void AuthWindow::buildUi() {
 
 void AuthWindow::showSignIn() { m_pages->setCurrentIndex(0); m_signInError->clear(); m_identity->setFocus(); }
 void AuthWindow::showCreateAccount() { m_pages->setCurrentIndex(1); m_registerError->clear(); m_username->setFocus(); }
-void AuthWindow::setBusy(bool busy) { m_signInButton->setEnabled(!busy); m_createButton->setEnabled(!busy); m_signInButton->setText(busy?QStringLiteral("Signing in…"):QStringLiteral("Sign In")); m_createButton->setText(busy?QStringLiteral("Creating account…"):QStringLiteral("Create Account")); QApplication::setOverrideCursor(busy?Qt::WaitCursor:Qt::ArrowCursor); if (!busy) QApplication::restoreOverrideCursor(); }
 void AuthWindow::submitSignIn() {
     m_signInError->clear(); if (m_identity->text().trimmed().isEmpty() || m_signInPassword->text().isEmpty()) { m_signInError->setText(QStringLiteral("Enter your email/username and password.")); return; }
-    setBusy(true); QString username,error; const bool ok=m_auth && m_auth->signIn(m_identity->text(),m_signInPassword->text(),&username,&error); m_signInPassword->clear(); setBusy(false);
+    m_signInButton->setEnabled(false); m_createButton->setEnabled(false); m_signInButton->setText(QStringLiteral("Signing in…"));
+    QString username,error;
+    bool ok = false;
+    {
+        BusyCursorGuard busyCursor;
+        ok=m_auth && m_auth->signIn(m_identity->text(),m_signInPassword->text(),&username,&error);
+    }
+    m_signInPassword->clear(); m_signInButton->setEnabled(true); m_createButton->setEnabled(true); m_signInButton->setText(QStringLiteral("Sign In"));
     if (!ok) { m_signInError->setText(error.isEmpty()?QStringLiteral("Sign in is temporarily unavailable."):error); return; }
     emit authenticated(username);
 }
@@ -104,7 +119,14 @@ void AuthWindow::submitRegistration() {
     m_registerError->clear();
     if (m_username->text().trimmed().isEmpty() || m_email->text().trimmed().isEmpty() || m_password->text().isEmpty() || m_confirm->text().isEmpty()) { m_registerError->setText(QStringLiteral("Complete every field to create your account.")); return; }
     if (m_password->text()!=m_confirm->text()) { m_registerError->setText(QStringLiteral("Passwords do not match.")); return; }
-    setBusy(true); QString error; const bool ok=m_auth && m_auth->registerUser(m_username->text(),m_email->text(),m_password->text(),&error); m_password->clear(); m_confirm->clear(); setBusy(false);
+    m_signInButton->setEnabled(false); m_createButton->setEnabled(false); m_createButton->setText(QStringLiteral("Creating account…"));
+    QString error;
+    bool ok = false;
+    {
+        BusyCursorGuard busyCursor;
+        ok=m_auth && m_auth->registerUser(m_username->text(),m_email->text(),m_password->text(),&error);
+    }
+    m_password->clear(); m_confirm->clear(); m_signInButton->setEnabled(true); m_createButton->setEnabled(true); m_createButton->setText(QStringLiteral("Create Account"));
     if (!ok) { m_registerError->setText(error.isEmpty()?QStringLiteral("Account creation is temporarily unavailable."):error); return; }
     QMessageBox::information(this,QStringLiteral("Account created"),QStringLiteral("Your local DataGuard account is ready. Sign in to continue."));
     m_identity->setText(m_email->text().trimmed().toLower()); showSignIn();

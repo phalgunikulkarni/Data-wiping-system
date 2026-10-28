@@ -41,4 +41,15 @@ if(BUILD_TESTING)
     )
     target_link_libraries(AuthServiceTests PRIVATE Qt6::Sql bcrypt)
     add_test(NAME AuthServiceTests COMMAND AuthServiceTests)
+
+    add_executable(DashboardStateTests
+        tests/DashboardStateTests.cpp
+        src/MainWindow.cpp
+        src/DeviceManager.cpp
+        src/ImageBackgroundWidget.cpp
+        resources.qrc
+    )
+    target_link_libraries(DashboardStateTests PRIVATE Qt6::Widgets)
+    add_test(NAME DashboardStateTests COMMAND DashboardStateTests)
+    set_tests_properties(DashboardStateTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

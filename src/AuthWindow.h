@@ -24,7 +24,6 @@ private:
     void showCreateAccount();
     void submitSignIn();
     void submitRegistration();
-    void setBusy(bool busy);
     DatabaseManager m_database;
     AuthService* m_auth = nullptr;
     QString m_startupError;

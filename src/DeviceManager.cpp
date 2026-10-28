@@ -1,11 +1,20 @@
 #include "DeviceManager.h"
 #include <windows.h>
-#include <winioctl.h>
 #include <string>
+#include <utility>
 
-std::vector<DriveInfo> DeviceManager::listRemovableDrives() {
-    std::vector<DriveInfo> drives;
+DeviceEnumerationResult DeviceManager::enumerateRemovableDrives() const {
+    DeviceEnumerationResult result;
+    SetLastError(ERROR_SUCCESS);
     DWORD mask = GetLogicalDrives();
+    const DWORD enumerationError = GetLastError();
+    if (mask == 0 && enumerationError != ERROR_SUCCESS) {
+        result.errorMessage = "Windows could not enumerate mounted drive letters. Error: " +
+                              std::to_string(enumerationError);
+        return result;
+    }
+
+    result.success = true;
 
     for (char letter = 'A'; letter <= 'Z'; ++letter) {
         if (!(mask & (1 << (letter - 'A')))) continue;
@@ -14,48 +23,38 @@ std::vector<DriveInfo> DeviceManager::listRemovableDrives() {
         UINT type = GetDriveTypeA(root.c_str());
 
         if (type == DRIVE_REMOVABLE) {
-            DriveInfo info;
+            DriveInfo info{};
             info.letter = letter;
-            info.model = "USB Drive";
+            info.mountPoint = root;
+            info.connected = true;
 
-            std::string volumePath = "\\\\.\\" + std::string(1, letter) + ":";
-            HANDLE hVolume = CreateFileA(volumePath.c_str(), 0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                NULL, OPEN_EXISTING, 0, NULL);
-
-            if (hVolume != INVALID_HANDLE_VALUE) {
-                VOLUME_DISK_EXTENTS extents;
-                DWORD bytesReturned;
-
-                if (DeviceIoControl(hVolume,
-                    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                    NULL, 0, &extents, sizeof(extents),
-                    &bytesReturned, NULL)) {
-
-                    info.diskNumber = extents.Extents[0].DiskNumber;
-                    info.path = "\\\\.\\PhysicalDrive" +
-                                std::to_string(info.diskNumber);
-
-                    HANDLE hPhysical = CreateFileA(info.path.c_str(), 0,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        NULL, OPEN_EXISTING, 0, NULL);
-
-                    if (hPhysical != INVALID_HANDLE_VALUE) {
-                        GET_LENGTH_INFORMATION lengthInfo;
-                        DWORD br;
-                        if (DeviceIoControl(hPhysical,
-                            IOCTL_DISK_GET_LENGTH_INFO,
-                            NULL, 0, &lengthInfo,
-                            sizeof(lengthInfo), &br, NULL)) {
-                            info.sizeBytes = lengthInfo.Length.QuadPart;
-                        }
-                        CloseHandle(hPhysical);
-                    }
-                }
-                CloseHandle(hVolume);
+            char volumeLabel[MAX_PATH + 1] = {};
+            char fileSystem[MAX_PATH + 1] = {};
+            const bool volumeInfoAvailable = GetVolumeInformationA(
+                root.c_str(), volumeLabel, MAX_PATH + 1,
+                nullptr, nullptr, nullptr, fileSystem, MAX_PATH + 1) != FALSE;
+            if (volumeInfoAvailable) {
+                info.volumeLabel = volumeLabel;
+                info.fileSystem = fileSystem;
             }
-            drives.push_back(info);
+
+            ULARGE_INTEGER availableBytes{};
+            ULARGE_INTEGER totalBytes{};
+            ULARGE_INTEGER totalFreeBytes{};
+            if (GetDiskFreeSpaceExA(root.c_str(), &availableBytes,
+                                    &totalBytes, &totalFreeBytes)) {
+                info.capacityBytes = totalBytes.QuadPart;
+                info.capacityAvailable = true;
+            }
+
+            // A removable drive letter can exist without mounted media. Only
+            // present a volume as connected when a read-only metadata query worked.
+            if (!volumeInfoAvailable && !info.capacityAvailable)
+                continue;
+
+            info.connected = true;
+            result.devices.push_back(std::move(info));
         }
     }
-    return drives;
+    return result;
 }
