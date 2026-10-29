@@ -130,8 +130,14 @@ public:
         existingEntry.name="existing.txt"; existingEntry.nameKnown=true; existingEntry.fullPath="Docs\\existing.txt";
         existingEntry.sizeBytes=17; existingEntry.sizeKnown=true;
         FileEntry deletedEntry; deletedEntry.status=FileStatus::DELETED; deletedEntry.confidence=FileRecordConfidence::Candidate;
-        deletedEntry.nameKnown=false; deletedEntry.parentPathKnown=true; deletedEntry.parentPath="Archive";
-        identified.entries={existingEntry,deletedEntry};
+        deletedEntry.nameKnown=false; deletedEntry.deletedMarkerObserved=true;
+        deletedEntry.parentPathKnown=true; deletedEntry.parentPath="Archive";
+        FileEntry invalidDeletedEntry; invalidDeletedEntry.status=FileStatus::INVALID;
+        invalidDeletedEntry.confidence=FileRecordConfidence::Invalid; invalidDeletedEntry.deletedMarkerObserved=true;
+        identified.entries={existingEntry,deletedEntry,invalidDeletedEntry};
+        const FileScanCounts dashboardCounts=aggregateFileEntries(identified.entries);
+        assert(dashboardCounts.existingFiles==1 && dashboardCounts.deletedEntryCandidates==1);
+        assert(dashboardCounts.invalidFileRecords==1 && dashboardCounts.invalidRecords==1);
         window.m_assessmentInProgress=true;
         window.m_fileScanInProgress=true;
         window.m_scanAnimation->start();
@@ -140,27 +146,33 @@ public:
         assert(!window.m_assessmentInProgress && !window.m_fileScanInProgress);
         assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
         assert(states->currentIndex()==5);
-        assert(window.m_assessmentStatus->text()==QStringLiteral("Potential Recovery Evidence Found"));
-        assert(window.m_assessmentSummary->text().contains(QStringLiteral("Existing files enumerated: 1")));
-        assert(window.m_assessmentSummary->text().contains(QStringLiteral("Deleted entries identified: 1")));
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Further Analysis Required"));
         auto* fileTable=window.findChild<QTableView*>(QStringLiteral("dashboardFileTable"));
         auto* fileSearch=window.findChild<QLineEdit*>(QStringLiteral("dashboardFileSearch"));
         auto* fileFilter=window.findChild<QComboBox*>(QStringLiteral("dashboardFileFilter"));
         auto* fileSection=window.findChild<QFrame*>(QStringLiteral("dashboardFilesOnDrive"));
         assert(fileTable && fileSearch && fileFilter && fileSection);
-        assert(fileTable->model()->columnCount()==4 && fileTable->model()->rowCount()==2);
+        assert(!window.findChild<QFrame*>(QStringLiteral("assessmentScanSummary")));
+        for (const QLabel* label : window.findChildren<QLabel*>())
+            assert(label->text()!=QStringLiteral("Scan Summary"));
+        assert(fileTable->model()->columnCount()==4 && fileTable->model()->rowCount()==3);
+        assert(static_cast<std::uint64_t>(fileTable->model()->rowCount()) ==
+               dashboardCounts.existingFiles+dashboardCounts.deletedEntryCandidates+dashboardCounts.invalidFileRecords);
         assert(fileTable->model()->index(0,0).data().toString()==QStringLiteral("existing.txt"));
         assert(fileTable->model()->index(0,1).data().toString()==QStringLiteral("Docs\\existing.txt"));
         assert(fileTable->model()->index(0,2).data().toString()==QStringLiteral("17 bytes"));
         assert(fileTable->model()->index(0,3).data().toString()==QStringLiteral("Existing"));
-        assert(fileTable->model()->index(1,0).data().toString()==QStringLiteral("Unavailable"));
+        assert(fileTable->model()->index(1,0).data().toString()==QStringLiteral("Unknown deleted entry"));
         assert(fileTable->model()->index(1,1).data().toString()==QStringLiteral("Archive"));
         assert(fileTable->model()->index(1,3).data().toString()==QStringLiteral("Deleted candidate"));
+        assert(fileTable->model()->index(2,0).data().toString()==QStringLiteral("Unknown deleted entry"));
+        assert(fileTable->model()->index(2,3).data().toString()==QStringLiteral("Invalid deleted entry"));
         fileFilter->setCurrentIndex(1); assert(fileTable->model()->rowCount()==1);
         fileFilter->setCurrentIndex(2); assert(fileTable->model()->rowCount()==1);
         fileFilter->setCurrentIndex(0); fileSearch->setText(QStringLiteral("not-present"));
         assert(fileTable->model()->rowCount()==0);
-        fileSearch->clear(); assert(fileTable->model()->rowCount()==2);
+        fileSearch->setText(QStringLiteral("Archive")); assert(fileTable->model()->rowCount()==1);
+        fileSearch->clear(); assert(fileTable->model()->rowCount()==3);
 
         FileScanResult noDeleted; noDeleted.status=FileScanStatus::Success; noDeleted.volumeIdentityValidated=true; noDeleted.entries={existingEntry};
         window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
@@ -179,7 +191,7 @@ public:
         window.m_scanAnimation->start();
         window.completeDriveAssessment(partial,assessmentDrive);
         assert(window.m_assessmentStatus->text()==QStringLiteral("Assessment Incomplete"));
-        assert(window.m_assessmentSummary->text().contains(QStringLiteral("Partial")));
+        assert(window.m_dashboardFileStatus->text().contains(QStringLiteral("Partial")));
         assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
         FileScanResult cancelled; cancelled.status=FileScanStatus::Cancelled;
         window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
@@ -228,39 +240,40 @@ public:
         QApplication::processEvents();
         assert(window.width() >= 960 && window.height() >= 640);
         auto* overviewCard=window.findChild<QFrame*>(QStringLiteral("assessmentDriveOverview"));
-        auto* summaryCard=window.findChild<QFrame*>(QStringLiteral("assessmentScanSummary"));
         auto* indicatorsCard=window.findChild<QFrame*>(QStringLiteral("recoverabilityIndicators"));
         auto* resultCard=window.findChild<QFrame*>(QStringLiteral("assessmentResult"));
-        assert(overviewCard && summaryCard && indicatorsCard && resultCard && fileSection);
-        assert(overviewCard->y()<summaryCard->y() && summaryCard->y()<fileSection->y() && fileSection->y()<indicatorsCard->y());
+        assert(overviewCard && indicatorsCard && resultCard && fileSection);
+        assert(overviewCard->y()<fileSection->y() && fileSection->y()<indicatorsCard->y());
         assert(indicatorsCard->x()<resultCard->x());
         window.resize(960, 640);
         QApplication::processEvents();
         assert(states->width() > 0 && states->height() > 0);
 
-        window.startDeviceScan();
-        assert(states->currentIndex() == 1); // Scanning state appears while enumeration runs.
-        assert(window.m_scanAnimation->state() == QAbstractAnimation::Running);
-        assert(!window.m_scanButton->isEnabled());
-        QThread* firstScan = window.m_scanThread;
-        window.startDeviceScan();
-        assert(window.m_scanThread == firstScan); // Repeat clicks cannot create another worker.
+        if (qEnvironmentVariable("DATAGUARD_ALLOW_REAL_DEVICES") == QStringLiteral("1")) {
+            window.startDeviceScan();
+            assert(states->currentIndex() == 1); // Scanning state appears while enumeration runs.
+            assert(window.m_scanAnimation->state() == QAbstractAnimation::Running);
+            assert(!window.m_scanButton->isEnabled());
+            QThread* firstScan = window.m_scanThread;
+            window.startDeviceScan();
+            assert(window.m_scanThread == firstScan); // Repeat clicks cannot create another worker.
 
-        QEventLoop waitForScan;
-        QTimer poll;
-        poll.setInterval(10);
-        QObject::connect(&poll, &QTimer::timeout, &waitForScan, [&window,&waitForScan]() {
-            if (!window.m_deviceScanInProgress)
-                waitForScan.quit();
-        });
-        QTimer::singleShot(5000, &waitForScan, &QEventLoop::quit);
-        poll.start();
-        waitForScan.exec();
-        poll.stop();
-        assert(!window.m_deviceScanInProgress);
-        assert(states->currentIndex() == 2 || states->currentIndex() == 3 || states->currentIndex() == 4);
-        assert(window.m_scanAnimation->state() == QAbstractAnimation::Stopped);
-        assert(window.m_scanButton->isEnabled());
+            QEventLoop waitForScan;
+            QTimer poll;
+            poll.setInterval(10);
+            QObject::connect(&poll, &QTimer::timeout, &waitForScan, [&window,&waitForScan]() {
+                if (!window.m_deviceScanInProgress)
+                    waitForScan.quit();
+            });
+            QTimer::singleShot(5000, &waitForScan, &QEventLoop::quit);
+            poll.start();
+            waitForScan.exec();
+            poll.stop();
+            assert(!window.m_deviceScanInProgress);
+            assert(states->currentIndex() == 2 || states->currentIndex() == 3 || states->currentIndex() == 4);
+            assert(window.m_scanAnimation->state() == QAbstractAnimation::Stopped);
+            assert(window.m_scanButton->isEnabled());
+        }
     }
 };
 

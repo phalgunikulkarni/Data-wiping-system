@@ -152,17 +152,31 @@ public:
     {
         if (!index.isValid() || index.row() < 0 || index.row() >= rowCount()) return {};
         const FileEntry& entry = m_entries[static_cast<std::size_t>(index.row())];
-        const int statusCode = entry.status == FileStatus::EXISTING ? 1 : 2;
+        const int statusCode = entry.status == FileStatus::EXISTING ? 1
+            : entry.status == FileStatus::DELETED ? 2 : 3;
         if (role == Qt::UserRole + 1 && index.column() == 3) return statusCode;
         if (role != Qt::DisplayRole) return {};
         const auto text = [](const std::string& value) { return QString::fromUtf8(value.data(),static_cast<qsizetype>(value.size())); };
         switch (index.column()) {
-        case 0: return entry.nameKnown && !entry.name.empty() ? text(entry.name) : QStringLiteral("Unavailable");
+        case 0:
+            if (entry.nameKnown && !entry.name.empty()) return text(entry.name);
+            if (entry.deletedMarkerObserved) {
+                if (entry.shortNameFragmentAvailable && !entry.shortNameFragment.empty())
+                    return QStringLiteral("Unknown deleted entry (short-name fragment: %1)").arg(text(entry.shortNameFragment));
+                return QStringLiteral("Unknown deleted entry");
+            }
+            return QStringLiteral("Unavailable");
         case 1:
             if (!entry.fullPath.empty()) return text(entry.fullPath);
-            return entry.parentPathKnown && !entry.parentPath.empty() ? text(entry.parentPath) : QStringLiteral("Unavailable");
+            if (entry.parentPathKnown) return entry.parentPath.empty() ? QStringLiteral("\\") : text(entry.parentPath);
+            return QStringLiteral("Unavailable");
         case 2: return entry.sizeKnown ? QStringLiteral("%1 bytes").arg(entry.sizeBytes) : QStringLiteral("Unavailable");
-        case 3: return statusCode == 1 ? QStringLiteral("Existing") : QStringLiteral("Deleted candidate");
+        case 3:
+            if (entry.status == FileStatus::EXISTING) return QStringLiteral("Existing");
+            if (entry.status == FileStatus::DELETED)
+                return entry.confidence == FileRecordConfidence::Ambiguous
+                    ? QStringLiteral("Deleted candidate · ambiguous") : QStringLiteral("Deleted candidate");
+            return entry.deletedMarkerObserved ? QStringLiteral("Invalid deleted entry") : QStringLiteral("Invalid record");
         default: return {};
         }
     }
@@ -185,9 +199,9 @@ public:
     }
 
     void setCounts(std::uint64_t existing, std::uint64_t deletedCandidates,
-                   std::uint64_t ambiguous, std::uint64_t invalid, bool available)
+                   std::uint64_t invalidRecords, bool available)
     {
-        m_counts = {existing, deletedCandidates, ambiguous, invalid};
+        m_counts = {existing, deletedCandidates, invalidRecords};
         m_available = available;
         update();
     }
@@ -202,16 +216,14 @@ protected:
         painter.setBrush(QColor(2, 9, 22, 160));
         painter.drawRoundedRect(bar, 7, 7);
 
-        const std::array<QColor, 4> colors = {
-            QColor(QStringLiteral("#2ca9c2")), QColor(QStringLiteral("#6bd8ee")),
-            QColor(QStringLiteral("#e56b9c")), QColor(QStringLiteral("#f09b72"))};
-        const std::array<QString, 4> labels = {
-            QStringLiteral("Existing"), QStringLiteral("Deleted candidates"),
-            QStringLiteral("Ambiguous"), QStringLiteral("Invalid")};
+        const std::array<QColor, 3> colors = {
+            QColor(QStringLiteral("#2ca9c2")), QColor(QStringLiteral("#e56b9c")), QColor(QStringLiteral("#f09b72"))};
+        const std::array<QString, 3> labels = {
+            QStringLiteral("Existing files"), QStringLiteral("Deleted candidates"), QStringLiteral("Invalid file records")};
         if (!m_available) {
             painter.setPen(QColor(QStringLiteral("#9eafc1")));
             painter.drawText(QRectF(2, 28, width() - 4, 22), Qt::AlignLeft | Qt::AlignVCenter,
-                             QStringLiteral("Distribution unavailable for this scan"));
+                             QStringLiteral("File counts unavailable for this scan"));
             return;
         }
 
@@ -220,7 +232,7 @@ protected:
         if (total == 0) {
             painter.setPen(QColor(QStringLiteral("#9eafc1")));
             painter.drawText(QRectF(2, 28, width() - 4, 22), Qt::AlignLeft | Qt::AlignVCenter,
-                             QStringLiteral("No directory records were returned"));
+                             QStringLiteral("No file records were returned"));
         } else {
             QPainterPath clip;
             clip.addRoundedRect(bar, 7, 7);
@@ -228,8 +240,8 @@ protected:
             painter.setClipPath(clip);
             qreal x = bar.left();
             int lastNonzero = -1;
-            for (int i = 0; i < 4; ++i) if (m_counts[static_cast<std::size_t>(i)] != 0) lastNonzero = i;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 3; ++i) if (m_counts[static_cast<std::size_t>(i)] != 0) lastNonzero = i;
+            for (int i = 0; i < 3; ++i) {
                 const auto count = m_counts[static_cast<std::size_t>(i)];
                 if (!count) continue;
                 const qreal segmentWidth = i == lastNonzero
@@ -242,7 +254,7 @@ protected:
         }
 
         const qreal columnWidth = width() / 2.0;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 3; ++i) {
             const int row = i / 2;
             const int column = i % 2;
             const qreal x = 2 + column * columnWidth;
@@ -258,7 +270,7 @@ protected:
     }
 
 private:
-    std::array<std::uint64_t, 4> m_counts{};
+    std::array<std::uint64_t, 3> m_counts{};
     bool m_available = false;
 };
 
@@ -669,42 +681,6 @@ QWidget* MainWindow::buildDashboardAssessmentPage()
     overviewLayout->addLayout(overviewGrid);
     layout->addWidget(overview);
 
-    auto* summary = makeCard(content);
-    summary->setObjectName(QStringLiteral("assessmentScanSummary"));
-    auto* summaryLayout = new QVBoxLayout(summary);
-    summaryLayout->setContentsMargins(16,11,16,12);
-    summaryLayout->setSpacing(8);
-    auto* summaryHeader = new QHBoxLayout;
-    auto* summaryTitle = heading(QStringLiteral("Scan Summary"),summary);
-    summaryTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:16px; font-weight:700;"));
-    summaryHeader->addWidget(summaryTitle);
-    summaryHeader->addStretch();
-    m_assessmentCompletionBadge = new QLabel(QStringLiteral("NOT SCANNED"),summary);
-    m_assessmentCompletionBadge->setAlignment(Qt::AlignCenter);
-    m_assessmentCompletionBadge->setStyleSheet(QStringLiteral("color:#9db1c5; background:rgba(59,75,95,100); border:1px solid rgba(125,153,180,65); border-radius:9px; padding:4px 9px; font-size:9px; font-weight:700; letter-spacing:1px;"));
-    summaryHeader->addWidget(m_assessmentCompletionBadge);
-    summaryLayout->addLayout(summaryHeader);
-    auto* metrics = new QGridLayout;
-    metrics->setSpacing(8);
-    const QStringList metricCaptions = {QStringLiteral("EXISTING FILES"),QStringLiteral("DELETED ENTRIES")};
-    const std::array<QString,2> metricColors = {QStringLiteral("#59cde2"),QStringLiteral("#83ddeb")};
-    for (int i = 0; i < static_cast<int>(m_assessmentMetricValues.size()); ++i) {
-        auto* tile = new QFrame(summary);
-        tile->setStyleSheet(QStringLiteral("QFrame { background:rgba(16,23,37,205); border:1px solid rgba(94,128,160,48); border-radius:10px; }"));
-        auto* tileLayout = new QVBoxLayout(tile);
-        tileLayout->setContentsMargins(11,7,11,7);
-        tileLayout->setSpacing(1);
-        auto* caption = new QLabel(metricCaptions[i],tile);
-        caption->setStyleSheet(QStringLiteral("color:#8198b1; font-size:9px; font-weight:700; letter-spacing:1px; background:transparent; border:0;"));
-        tileLayout->addWidget(caption);
-        m_assessmentMetricValues[static_cast<std::size_t>(i)] = new QLabel(QStringLiteral("—"),tile);
-        m_assessmentMetricValues[static_cast<std::size_t>(i)]->setStyleSheet(QStringLiteral("color:%1; font-size:22px; font-weight:700; background:transparent; border:0;" ).arg(metricColors[static_cast<std::size_t>(i)]));
-        tileLayout->addWidget(m_assessmentMetricValues[static_cast<std::size_t>(i)]);
-        metrics->addWidget(tile,0,i);
-    }
-    summaryLayout->addLayout(metrics);
-    layout->addWidget(summary);
-
     auto* files = makeCard(content);
     files->setObjectName(QStringLiteral("dashboardFilesOnDrive"));
     auto* filesLayout = new QVBoxLayout(files);
@@ -732,7 +708,6 @@ QWidget* MainWindow::buildDashboardAssessmentPage()
     m_dashboardFileStatus->setObjectName(QStringLiteral("dashboardFileStatus"));
     m_dashboardFileStatus->setStyleSheet(QStringLiteral("color:#91a8bf; font-size:11px;"));
     filesLayout->addWidget(m_dashboardFileStatus);
-    m_assessmentSummary = m_dashboardFileStatus;
     m_dashboardFileTable = new QTableView(files);
     m_dashboardFileTable->setObjectName(QStringLiteral("dashboardFileTable"));
     m_dashboardFileModel = new DashboardFileTableModel(m_dashboardFileTable);
@@ -769,7 +744,7 @@ QWidget* MainWindow::buildDashboardAssessmentPage()
     auto* indicatorsTitle = heading(QStringLiteral("Recoverability Indicators"),indicators);
     indicatorsTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:15px; font-weight:700;"));
     indicatorsLayout->addWidget(indicatorsTitle);
-    auto* chartLabel = bodyText(QStringLiteral("Directory record distribution"),indicators);
+    auto* chartLabel = bodyText(QStringLiteral("File listing counts · directories excluded"),indicators);
     chartLabel->setStyleSheet(QStringLiteral("color:#88a1ba; font-size:11px;"));
     indicatorsLayout->addWidget(chartLabel);
     m_evidenceBreakdown = new EvidenceBreakdownWidget(indicators);
@@ -925,54 +900,69 @@ void MainWindow::startDeletedEntryScan()
     m_fileScanStatus->setText(QStringLiteral("Reading FAT32 directory metadata…"));
 
     const DriveInfo selected = m_selectedDriveInfo;
-    launchFat32Scan(selected,[this,sourceLabel](const FileScanResult& result) {
-        completeDeletedEntryScan(result,sourceLabel);
+    const QString expectedIdentity = m_selectedDeviceIdentity;
+    launchFat32Scan(selected,[this,sourceLabel,expectedIdentity](const FileScanResult& result) {
+        completeDeletedEntryScan(result,sourceLabel,expectedIdentity);
     });
 }
 
-void MainWindow::completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume)
+void MainWindow::completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume,
+                                          const QString& expectedVolumeIdentity)
 {
     m_fileScanInProgress = false;
     m_fileScanButton->setEnabled(true);
     m_fileScanCancelButton->setEnabled(false);
     m_fileScanSource->setText(sourceVolume);
     m_fileResultsList->clear();
-    if (result.status != FileScanStatus::Success) {
+    if (!m_hasSelectedDrive || m_selectedDeviceIdentity != expectedVolumeIdentity ||
+        volumeIdentity(m_selectedDriveInfo) != expectedVolumeIdentity) {
+        m_fileScanStatus->setText(QStringLiteral("Results discarded: the selected volume changed during the scan."));
+        m_fileScanCancelled.reset();
+        return;
+    }
+    if (result.status != FileScanStatus::Success && result.status != FileScanStatus::Partial) {
         QString message = QString::fromStdString(result.errorMessage);
         if (message.isEmpty()) message = QStringLiteral("FAT32 identification could not be completed.");
         m_fileScanStatus->setText(message);
         m_fileScanCancelled.reset();
         return;
     }
-    int deletedCount = 0;
+    if (!result.volumeIdentityValidated) {
+        m_fileScanStatus->setText(QStringLiteral("Results discarded: the scan completed without a validated volume identity."));
+        m_fileScanCancelled.reset();
+        return;
+    }
     for (const FileEntry& entry : result.entries) {
-        if (entry.status == FileStatus::DELETED) ++deletedCount;
-        const QString state = entry.status == FileStatus::DELETED ? QStringLiteral("Deleted entry candidate")
-            : entry.status == FileStatus::INVALID ? QStringLiteral("Invalid / ambiguous")
-            : QStringLiteral("Existing entry");
-        const QString name = entry.nameKnown && !entry.name.empty()
-            ? QString::fromUtf8(entry.name.data(),static_cast<qsizetype>(entry.name.size()))
-            : QStringLiteral("Unknown name");
-        const QString path = entry.fullPath.empty() ? name
-            : QString::fromUtf8(entry.fullPath.data(),static_cast<qsizetype>(entry.fullPath.size()));
-        const QString location = entry.fullPath.empty()
-            ? QStringLiteral("Parent directory: %1").arg(!entry.parentPathKnown
-                  ? QStringLiteral("Unknown")
-                  : entry.parentPath.empty() ? QStringLiteral("volume root")
-                  : QString::fromUtf8(entry.parentPath.data(),static_cast<qsizetype>(entry.parentPath.size())))
-            : path;
-        const QString size = entry.sizeKnown ? QStringLiteral("%1 bytes").arg(entry.sizeBytes) : QStringLiteral("Unknown size");
+        const auto text = [](const std::string& value) {
+            return QString::fromUtf8(value.data(),static_cast<qsizetype>(value.size()));
+        };
+        const QString state = entry.status == FileStatus::DELETED
+            ? entry.confidence == FileRecordConfidence::Ambiguous
+                ? QStringLiteral("Deleted entry candidate · ambiguous") : QStringLiteral("Deleted entry candidate")
+            : entry.status == FileStatus::INVALID
+                ? (entry.deletedMarkerObserved ? QStringLiteral("Invalid deleted entry") : QStringLiteral("Invalid record"))
+                : entry.isDirectory ? QStringLiteral("Existing directory entry") : QStringLiteral("Existing file entry");
+        const QString name = entry.nameKnown && !entry.name.empty() ? text(entry.name)
+            : entry.deletedMarkerObserved && entry.shortNameFragmentAvailable
+                ? QStringLiteral("Unknown deleted entry (short-name fragment: %1)").arg(text(entry.shortNameFragment))
+                : entry.deletedMarkerObserved ? QStringLiteral("Unknown deleted entry") : QStringLiteral("Unavailable");
+        const QString location = !entry.fullPath.empty() ? text(entry.fullPath)
+            : QStringLiteral("Parent directory: %1").arg(!entry.parentPathKnown
+                  ? QStringLiteral("Unavailable")
+                  : entry.parentPath.empty() ? QStringLiteral("volume root") : text(entry.parentPath));
+        const QString size = entry.sizeKnown ? QStringLiteral("%1 bytes").arg(entry.sizeBytes) : QStringLiteral("Unavailable");
         auto* item = new QListWidgetItem(QStringLiteral("%1\n%2 · %3 · %4")
-            .arg(state,location,size,QString::fromStdString(entry.reason)),m_fileResultsList);
-        item->setToolTip(QString::fromStdString(entry.reason));
+            .arg(state,name,location,size),m_fileResultsList);
+        item->setToolTip(text(entry.reason));
         item->setData(Qt::UserRole,QString::fromStdString(entry.identity));
         item->setFlags(item->flags() & ~Qt::ItemIsSelectable);
         item->setSizeHint(QSize(100,72));
     }
-    m_fileScanStatus->setText(QStringLiteral("Identification complete: %1 deleted-entry candidate(s), %2 total directory record(s). No recoverability claim is made.")
-                                   .arg(deletedCount).arg(result.entries.size()));
+    m_fileScanStatus->setText(result.status == FileScanStatus::Partial
+        ? QStringLiteral("Identification was partial. Deleted entries are candidates only; recoverability is unknown.")
+        : QStringLiteral("Identification complete. Deleted entries are candidates only; recoverability is unknown."));
     if (result.entries.empty())
-        m_fileScanStatus->setText(QStringLiteral("No directory entries were identified in the supported FAT32 metadata."));
+        m_fileScanStatus->setText(QStringLiteral("No filesystem records were identified in the supported FAT32 metadata."));
     m_fileScanCancelled.reset();
 }
 
@@ -999,7 +989,6 @@ void MainWindow::startDriveAssessment()
     m_fileSearch->clear();
     m_fileFilter->setCurrentIndex(0);
     m_dashboardFileStatus->setText(QStringLiteral("Scanning FAT32 directory records… results will appear here when validation completes."));
-    for (QLabel* metric : m_assessmentMetricValues) metric->setText(QStringLiteral("…"));
     m_progressStatusLabel->setText(QStringLiteral("Assessing selected drive…"));
     m_progressDetailLabel->setText(QStringLiteral("Reading FAT32 directory metadata. Progress is indeterminate; no drive contents are modified."));
     m_dashboardStates->setCurrentIndex(1);
@@ -1058,11 +1047,10 @@ void MainWindow::completeDriveAssessment(const FileScanResult& result, const Dri
     if (m_fileFilter) m_fileFilter->setCurrentIndex(0);
     if (!currentVolume) {
         m_dashboardFileStatus->setText(QStringLiteral("Results discarded: the selected volume changed or became stale during the scan."));
-        for (QLabel* metric : m_assessmentMetricValues) metric->setText(QStringLiteral("Unavailable"));
         m_assessmentStatus->setText(QStringLiteral("Assessment Incomplete"));
         m_assessmentExplanation->setText(QStringLiteral("The scan result no longer matches the selected volume identity. Rescan the device before continuing."));
         m_assessmentNextSteps->clear();
-        m_evidenceBreakdown->setCounts(0,0,0,0,false);
+        m_evidenceBreakdown->setCounts(0,0,0,false);
         m_dashboardStates->setCurrentIndex(5);
         m_fileScanCancelled.reset();
         return;
@@ -1105,28 +1093,17 @@ void MainWindow::completeDriveAssessment(const FileScanResult& result, const Dri
     evidence.volumeIdentityValidated = result.volumeIdentityValidated &&
         result.status != FileScanStatus::StaleVolume && !identity.isEmpty() &&
         volumeIdentity(drive) == m_selectedDeviceIdentity;
-    std::uint64_t chartExisting = 0;
-    std::uint64_t chartDeleted = 0;
-    std::uint64_t chartAmbiguous = 0;
-    std::uint64_t chartInvalid = 0;
-    if (result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial) {
+    FileScanCounts fileCounts;
+    if ((result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial) &&
+        result.volumeIdentityValidated) {
         evidence.scanState = result.status == FileScanStatus::Success ? AssessmentScanState::Complete : AssessmentScanState::Partial;
         evidence.filesystemValid = result.status == FileScanStatus::Success;
-        for (const FileEntry& entry : result.entries) {
-            if (entry.status == FileStatus::EXISTING && !entry.isDirectory)
-                ++evidence.existingFileCount;
-            if (entry.status == FileStatus::EXISTING) ++chartExisting;
-            if (entry.status == FileStatus::DELETED) {
-                if (!entry.isDirectory) {
-                    ++evidence.deletedEntryCount;
-                    if (!entry.nameKnown) ++evidence.deletedEntriesWithUnknownName;
-                }
-                if (entry.confidence == FileRecordConfidence::Ambiguous) ++chartAmbiguous;
-                else ++chartDeleted;
-            }
-            if (entry.status == FileStatus::INVALID) { ++evidence.invalidEntryCount; ++chartInvalid; }
-            if (entry.confidence == FileRecordConfidence::Ambiguous) ++evidence.ambiguousEntryCount;
-        }
+        fileCounts = aggregateFileEntries(result.entries);
+        evidence.existingFileCount = fileCounts.existingFiles;
+        evidence.deletedEntryCount = fileCounts.deletedEntryCandidates;
+        evidence.deletedEntriesWithUnknownName = fileCounts.deletedNamesUnknown;
+        evidence.invalidEntryCount = fileCounts.invalidRecords;
+        evidence.ambiguousEntryCount = fileCounts.ambiguousRecords;
     } else if (result.status == FileScanStatus::Cancelled) {
         evidence.scanState = AssessmentScanState::Cancelled;
     } else if (result.status == FileScanStatus::Unsupported) {
@@ -1146,57 +1123,46 @@ void MainWindow::completeDriveAssessment(const FileScanResult& result, const Dri
     m_assessmentExplanation->setText(QString::fromStdString(assessment.explanation));
     m_assessmentNextSteps->setText(QStringLiteral("Recommended next step: %1").arg(QString::fromStdString(assessment.recommendedNextStep)));
 
-    const QString scanState = result.status == FileScanStatus::Success ? QStringLiteral("Complete (FAT32 metadata enumeration)")
+    const QString scanState = result.status == FileScanStatus::Success && result.volumeIdentityValidated ? QStringLiteral("Complete (FAT32 metadata enumeration)")
+        : result.status == FileScanStatus::Success ? QStringLiteral("Identity validation failed")
         : result.status == FileScanStatus::Partial ? QStringLiteral("Partial")
         : result.status == FileScanStatus::Cancelled ? QStringLiteral("Cancelled")
         : result.status == FileScanStatus::Unsupported ? QStringLiteral("Unsupported filesystem")
         : QStringLiteral("Failed");
-    const QString completionLabel = result.status == FileScanStatus::Success ? QStringLiteral("COMPLETE")
-        : result.status == FileScanStatus::Partial ? QStringLiteral("PARTIAL")
-        : result.status == FileScanStatus::Cancelled ? QStringLiteral("CANCELLED")
-        : result.status == FileScanStatus::Unsupported ? QStringLiteral("UNSUPPORTED")
-        : QStringLiteral("FAILED");
-    m_assessmentCompletionBadge->setText(completionLabel);
-    const QString badgeColor = result.status == FileScanStatus::Success ? QStringLiteral("#78dfba")
-        : result.status == FileScanStatus::Partial ? QStringLiteral("#f0c17b")
-        : result.status == FileScanStatus::Unsupported ? QStringLiteral("#a9bdd0")
-        : QStringLiteral("#e98a9e");
-    m_assessmentCompletionBadge->setStyleSheet(QStringLiteral("color:%1; background:rgba(30,48,56,150); border:1px solid rgba(112,160,170,70); border-radius:9px; padding:4px 9px; font-size:9px; font-weight:700; letter-spacing:0.5px;").arg(badgeColor));
     const QString error = result.errorMessage.empty() ? QStringLiteral("None reported") : QString::fromStdString(result.errorMessage);
-    const bool countsAvailable = result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial;
-    const QString existingCount = countsAvailable ? QString::number(evidence.existingFileCount) : QStringLiteral("Unavailable");
-    const QString deletedCount = countsAvailable ? QString::number(evidence.deletedEntryCount) : QStringLiteral("Unavailable");
+    const bool countsAvailable = (result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial) &&
+        result.volumeIdentityValidated && result.status != FileScanStatus::StaleVolume;
     const QString invalidCount = countsAvailable ? QString::number(evidence.invalidEntryCount) : QStringLiteral("Unavailable");
     const QString ambiguousCount = countsAvailable ? QString::number(evidence.ambiguousEntryCount) : QStringLiteral("Unavailable");
     const QString unknownNameCount = countsAvailable ? QString::number(evidence.deletedEntriesWithUnknownName) : QStringLiteral("Unavailable");
-    const QString readErrorState = result.readError ? QStringLiteral("Detected") : QStringLiteral("None reported");
-    m_assessmentMetricValues[0]->setText(existingCount);
-    m_assessmentMetricValues[1]->setText(deletedCount);
-    m_evidenceBreakdown->setCounts(chartExisting,chartDeleted,chartAmbiguous,chartInvalid,countsAvailable);
+    m_evidenceBreakdown->setCounts(fileCounts.existingFiles,fileCounts.deletedEntryCandidates,
+                                   fileCounts.invalidFileRecords,countsAvailable);
     if (countsAvailable) {
         std::vector<FileEntry> displayEntries;
         displayEntries.reserve(result.entries.size());
         for (const FileEntry& entry : result.entries) {
-            if (entry.isDirectory || (entry.status != FileStatus::EXISTING && entry.status != FileStatus::DELETED))
+            if (!isListedFileRecord(entry))
                 continue;
             displayEntries.push_back(entry);
         }
         m_dashboardFileModel->setEntries(std::move(displayEntries));
     }
     if (!countsAvailable) {
-        m_dashboardFileStatus->setText(QStringLiteral("File records unavailable · Completion: %1 · %2").arg(scanState,error));
+        const QString validationMessage = (result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial) &&
+            !result.volumeIdentityValidated ? QStringLiteral("The scan result has no validated volume identity.") : error;
+        m_dashboardFileStatus->setText(QStringLiteral("File records unavailable · Completion: %1 · %2").arg(scanState,validationMessage));
     } else if (m_dashboardFileModel->rowCount() == 0) {
         m_dashboardFileStatus->setText(QStringLiteral("No file records were identified for this scan · Completion: %1").arg(scanState));
     } else {
-        m_dashboardFileStatus->setText(QStringLiteral("Existing files enumerated: %1 · Deleted entries identified: %2 · %3 file record(s) · Completion: %4. Deleted candidates are not confirmed recoverable files.")
-                                           .arg(existingCount,deletedCount).arg(m_dashboardFileModel->rowCount()).arg(scanState));
+        m_dashboardFileStatus->setText(QStringLiteral("Scan %1. Deleted entries are candidates, not confirmed recoverable files; invalid records remain marked as invalid.")
+                                           .arg(scanState));
     }
     const QString filesystemValidity = evidence.filesystemValid ? QStringLiteral("valid FAT32 metadata")
         : supported ? QStringLiteral("not verified") : QStringLiteral("unsupported");
     const QString identityValidity = evidence.volumeIdentityValidated ? QStringLiteral("validated snapshot") : QStringLiteral("unavailable or stale");
     const QString physicalMetadata = drive.partitionInfoAvailable || !drive.physicalDiskNumber.empty()
         ? QStringLiteral("available where reported; see Drive Overview") : QStringLiteral("unavailable");
-    m_assessmentIndicators->setText(QStringLiteral("Filesystem support and validity: %1 · %2\nSelected volume identity: %3\nPhysical disk/partition metadata: %4\nScan completeness: %5\nDeleted-entry names unavailable: %6\nInvalid records: %7\nAmbiguous or potentially reused starting clusters: %8\n\nLimitations: FAT32 only; deleted directories are not traversed; hidden-file counts and file-content recoverability are not assessed. A zero deleted-entry count does not prove that no deleted files exist.")
+    m_assessmentIndicators->setText(QStringLiteral("Filesystem support and validity: %1 · %2\nSelected volume identity: %3\nPhysical disk/partition metadata: %4\nScan completeness: %5\nDeleted-entry names unavailable: %6\nInvalid records: %7\nAmbiguous records or potentially reused starting clusters: %8\n\nTable and chart count one row per non-directory filesystem entry, including invalid records. Invalid and ambiguous diagnostics also include directory records; ambiguous records can overlap deleted candidates. FAT32 only; deleted directories are not traversed; hidden-file counts and content recoverability are not assessed.")
         .arg(filesystem,filesystemValidity,identityValidity,physicalMetadata,scanState,unknownNameCount,invalidCount,ambiguousCount));
     m_dashboardStates->setCurrentIndex(5);
     m_fileScanCancelled.reset();
@@ -1359,14 +1325,12 @@ void MainWindow::selectDeviceRow(int row)
     if (m_dashboardFileModel) m_dashboardFileModel->setEntries({});
     if (m_dashboardFileStatus)
         m_dashboardFileStatus->setText(QStringLiteral("Run a supported FAT32 scan to list records for this selected volume."));
-    for (QLabel* metric : m_assessmentMetricValues) if (metric) metric->setText(QStringLiteral("—"));
-    if (m_evidenceBreakdown) m_evidenceBreakdown->setCounts(0,0,0,0,false);
+    if (m_evidenceBreakdown) m_evidenceBreakdown->setCounts(0,0,0,false);
     if (m_assessmentStatus) m_assessmentStatus->setText(QStringLiteral("Assessment Incomplete"));
     if (m_assessmentExplanation) m_assessmentExplanation->clear();
     if (m_assessmentNextSteps) m_assessmentNextSteps->clear();
     if (m_assessmentIndicators)
         m_assessmentIndicators->setText(QStringLiteral("The selected drive has not been assessed."));
-    if (m_assessmentCompletionBadge) m_assessmentCompletionBadge->setText(QStringLiteral("NOT SCANNED"));
     if (m_dashboardFileProxy) {
         m_fileSearch->clear();
         m_fileFilter->setCurrentIndex(0);

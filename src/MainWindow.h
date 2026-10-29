@@ -54,7 +54,8 @@ private:
     void displayDeviceResults(const DeviceEnumerationResult& result);
     void selectDeviceRow(int row);
     void startDeletedEntryScan();
-    void completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume);
+    void completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume,
+                                  const QString& expectedVolumeIdentity);
     void startDriveAssessment();
     void completeDriveAssessment(const FileScanResult& result, const DriveInfo& drive);
     void launchFat32Scan(const DriveInfo& drive, std::function<void(const FileScanResult&)> completion);
@@ -87,14 +88,11 @@ private:
     QPushButton* m_assessmentCancelButton = nullptr;
     QLabel* m_fileScanStatus = nullptr;
     QLabel* m_fileScanSource = nullptr;
-    QLabel* m_assessmentSummary = nullptr;
     QLabel* m_assessmentIndicators = nullptr;
     QLabel* m_assessmentStatus = nullptr;
     QLabel* m_assessmentExplanation = nullptr;
     QLabel* m_assessmentNextSteps = nullptr;
-    QLabel* m_assessmentCompletionBadge = nullptr;
     std::array<QLabel*, 8> m_driveOverviewValues{};
-    std::array<QLabel*, 2> m_assessmentMetricValues{};
     EvidenceBreakdownWidget* m_evidenceBreakdown = nullptr;
     QLineEdit* m_fileSearch = nullptr;
     QComboBox* m_fileFilter = nullptr;

@@ -108,7 +108,9 @@ int main()
     int duplicateNames=0; bool unicodePath=false;
     for(const auto& entry:existing.entries) { paths.insert(entry.fullPath); if(entry.name=="same.txt")++duplicateNames; if(entry.name.find("файл")!=std::string::npos)unicodePath=true; }
     assert(paths.size()==existing.entries.size() && duplicateNames==2 && unicodePath);
-    assert(scanner.scanExisting("C:\\").empty());
+    const FileScanResult missingRoot = scanner.scanExistingRoot(
+        QDir(root).filePath(QStringLiteral("missing-root")));
+    assert(missingRoot.status == FileScanStatus::Error && missingRoot.entries.empty());
     assert(scanner.scanDeleted("\\\\.\\PhysicalDrive0").status==FileScanStatus::Unsupported);
 
     auto image=makeImage();
@@ -119,11 +121,26 @@ int main()
     for(const auto& entry:parsed.entries) {
         assert(entry.entryIdentityAvailable && !entry.identity.empty() && !entry.operationEligible);
         identities.insert(entry.identity);
-        if(entry.status==FileStatus::DELETED) { ++deletedCount; assert(!entry.nameKnown); assert(entry.confidence==FileRecordConfidence::Candidate); }
+        if(entry.status==FileStatus::DELETED) {
+            ++deletedCount; assert(!entry.nameKnown); assert(entry.confidence==FileRecordConfidence::Candidate);
+            assert(entry.shortNameFragmentAvailable && !entry.shortNameFragment.empty() && entry.shortNameFragment[0]=='?');
+        }
         if(entry.status==FileStatus::EXISTING) ++existingCount;
         if(entry.status==FileStatus::DELETED && entry.parentDirectoryCluster==5) { nested=true; assert(entry.parentPath=="SUBDIR"); }
     }
     assert(identities.size()==parsed.entries.size() && deletedCount==2 && existingCount==3 && nested);
+    const FileScanCounts fileCounts=aggregateFileEntries(parsed.entries);
+    assert(fileCounts.existingFiles==2 && fileCounts.deletedEntryCandidates==2);
+    assert(fileCounts.invalidFileRecords==0 && fileCounts.invalidRecords==0 && fileCounts.ambiguousRecords==0);
+    const std::uint64_t legacyAllExistingRecords=static_cast<std::uint64_t>(std::count_if(parsed.entries.begin(),parsed.entries.end(),[](const FileEntry& entry) {
+        return entry.status==FileStatus::EXISTING;
+    }));
+    assert(legacyAllExistingRecords==3 && legacyAllExistingRecords!=fileCounts.existingFiles); // One of three is a directory.
+    std::vector<FileEntry> samePathRecords;
+    FileEntry samePathA; samePathA.status=FileStatus::EXISTING; samePathA.fullPath="same.txt";
+    FileEntry samePathB=samePathA; samePathB.identity="different-directory-slot";
+    samePathRecords={samePathA,samePathB};
+    assert(aggregateFileEntries(samePathRecords).existingFiles==2); // Distinct records are counted, not deduplicated by path/name.
     const DeletedEntryOperationTarget notReady{};
     assert(!notReady.validated && notReady.extents.empty());
     int namedSame=0;
@@ -147,6 +164,39 @@ int main()
     assert(longNameResult.status==FileScanStatus::Success && longNameResult.entries.size()==1);
     assert(longNameResult.entries.front().status==FileStatus::EXISTING);
     assert(longNameResult.entries.front().nameKnown && longNameResult.entries.front().name==longName);
+    auto malformedExistingLfn=std::make_shared<FakeVolume>(*longNameImage);
+    malformedExistingLfn->image[rootOffset+13]^=0x01;
+    const auto malformedExistingLfnResult=scan(malformedExistingLfn);
+    assert(malformedExistingLfnResult.status==FileScanStatus::Success);
+    assert(malformedExistingLfnResult.entries.front().nameKnown);
+    assert(malformedExistingLfnResult.entries.front().name=="LONGNA~1.TXT"); // Invalid LFN falls back to the validated short name.
+
+    auto deletedLongNameImage=std::make_shared<FakeVolume>(*longNameImage);
+    deletedLongNameImage->image[rootOffset+32]=0xE5; // Short-name first byte is lost even when the LFN slot survives.
+    auto deletedLongNameResult=scan(deletedLongNameImage);
+    assert(deletedLongNameResult.status==FileScanStatus::Success && deletedLongNameResult.entries.size()==1);
+    assert(deletedLongNameResult.entries.front().status==FileStatus::DELETED);
+    assert(!deletedLongNameResult.entries.front().nameKnown && deletedLongNameResult.entries.front().name.empty());
+    assert(deletedLongNameResult.entries.front().shortNameFragmentAvailable);
+
+    auto removedLfnMarkers=std::make_shared<FakeVolume>(*deletedLongNameImage);
+    removedLfnMarkers->image[rootOffset]=0xE5; // FAT deletion destroys the LFN sequence-order byte.
+    auto removedLfnResult=scan(removedLfnMarkers);
+    assert(removedLfnResult.status==FileScanStatus::Success && removedLfnResult.entries.size()==1);
+    assert(!removedLfnResult.entries.front().nameKnown);
+    assert(removedLfnResult.entries.front().shortNameFragmentAvailable);
+
+    auto misorderedDeletedLfn=std::make_shared<FakeVolume>(*deletedLongNameImage);
+    misorderedDeletedLfn->image[rootOffset]=0x42; // Says there are two LFN slots, but only one is present.
+    auto misorderedResult=scan(misorderedDeletedLfn);
+    assert(misorderedResult.status==FileScanStatus::Success && !misorderedResult.entries.front().nameKnown);
+    assert(misorderedResult.entries.front().shortNameFragmentAvailable);
+
+    auto badDeletedLfnChecksum=std::make_shared<FakeVolume>(*deletedLongNameImage);
+    badDeletedLfnChecksum->image[rootOffset+13]^=0x01;
+    auto badChecksumResult=scan(badDeletedLfnChecksum);
+    assert(badChecksumResult.status==FileScanStatus::Success && !badChecksumResult.entries.front().nameKnown);
+    assert(badChecksumResult.entries.front().shortNameFragmentAvailable);
 
     auto malformed=makeImage();
     writeShort(malformed->image,clusterOffset(2),"BADATTR TXT",0xC0,6,12);
@@ -185,11 +235,21 @@ int main()
     auto invalidCluster=makeImage(); writeShort(invalidCluster->image,clusterOffset(2),"BROKEN  TXT",0x20,0x0FFFFFFF,4096,true);
     auto invalidResult=scan(invalidCluster); assert(invalidResult.status==FileScanStatus::Success && !invalidResult.entries.empty());
     assert(invalidResult.entries.front().status==FileStatus::INVALID);
+    assert(!invalidResult.entries.front().sizeKnown && invalidResult.entries.front().shortNameFragmentAvailable);
+    const FileScanCounts invalidCounts=aggregateFileEntries(invalidResult.entries);
+    assert(invalidCounts.invalidFileRecords==1 && invalidCounts.deletedEntryCandidates==1);
     auto reused=makeImage(); writeShort(reused->image,clusterOffset(2)+32,"LIVE    TXT",0x20,3,500);
     auto reusedResult=scan(reused); assert(reusedResult.status==FileScanStatus::Success);
     bool markedReused=false;
     for(const auto& entry:reusedResult.entries) if(entry.status==FileStatus::DELETED && entry.parentDirectoryCluster==2)
-        markedReused=entry.confidence==FileRecordConfidence::Ambiguous && entry.reason.find("allocated")!=std::string::npos;
+        markedReused=entry.confidence==FileRecordConfidence::Ambiguous && !entry.sizeKnown && entry.reason.find("allocated")!=std::string::npos;
     assert(markedReused);
+    const FileScanCounts reusedCounts=aggregateFileEntries(reusedResult.entries);
+    assert(reusedCounts.existingFiles==2 && reusedCounts.deletedEntryCandidates==2);
+    assert(reusedCounts.ambiguousRecords==1); // Ambiguity is diagnostic and overlaps the candidate category.
+    const std::uint64_t legacyNonAmbiguousDeleted=static_cast<std::uint64_t>(std::count_if(reusedResult.entries.begin(),reusedResult.entries.end(),[](const FileEntry& entry) {
+        return entry.status==FileStatus::DELETED && entry.confidence!=FileRecordConfidence::Ambiguous;
+    }));
+    assert(legacyNonAmbiguousDeleted==1 && reusedCounts.deletedEntryCandidates==legacyNonAmbiguousDeleted+reusedCounts.ambiguousRecords);
     return 0;
 }

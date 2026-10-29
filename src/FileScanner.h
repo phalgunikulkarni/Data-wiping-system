@@ -27,12 +27,34 @@ struct FileEntry {
     bool entryIdentityAvailable = false;
     std::string volumeIdentity;
     std::string identity;
+    // Deleted FAT short names lose their first byte when marked 0xE5. Any
+    // surviving suffix is presentation-only and is never a validated name.
+    std::string shortNameFragment;
+    bool shortNameFragmentAvailable = false;
     bool sizeKnown = false;
     bool nameKnown = false;
+    bool deletedMarkerObserved = false;
     FileRecordConfidence confidence = FileRecordConfidence::Validated;
     bool operationEligible = false;
     std::string reason;
 };
+
+struct FileScanCounts {
+    std::uint64_t existingFiles = 0;
+    std::uint64_t deletedEntryCandidates = 0;
+    std::uint64_t invalidFileRecords = 0;
+    std::uint64_t invalidRecords = 0;
+    std::uint64_t ambiguousRecords = 0; // Diagnostic subset; may overlap deleted candidates.
+    std::uint64_t deletedNamesUnknown = 0;
+};
+
+// Shared UI/reporting policy: every non-directory parser record is a table row,
+// including invalid records. Existing/deleted totals count only those statuses;
+// invalid/ambiguous totals remain diagnostics and ambiguous may overlap. Counts
+// are entry-record counts, not unique-name/path counts; distinct directory slots
+// remain distinct even when names or paths collide.
+bool isListedFileRecord(const FileEntry& entry);
+FileScanCounts aggregateFileEntries(const std::vector<FileEntry>& entries);
 
 struct FileScanResult {
     FileScanStatus status = FileScanStatus::Error;

@@ -121,16 +121,20 @@ done:
 QString decodeShortName(const std::uint8_t* name, bool deleted)
 {
     QString base;
-    for (int i = 0; i < 8 && name[i] != ' '; ++i) {
-        if (i == 0 && deleted) return {};
+    if (deleted) base.append(QLatin1Char('?'));
+    const int firstKnown = deleted ? 1 : 0;
+    bool hasSurvivingBase = false;
+    for (int i = firstKnown; i < 8 && name[i] != ' '; ++i) {
         if (name[i] < 0x20 || name[i] > 0x7E) return {};
         base.append(QChar(name[i]));
+        hasSurvivingBase = true;
     }
     QString extension;
     for (int i = 8; i < 11 && name[i] != ' '; ++i) {
         if (name[i] < 0x20 || name[i] > 0x7E) return {};
         extension.append(QChar(name[i]));
     }
+    if (deleted && !hasSurvivingBase && extension.isEmpty()) return {};
     return extension.isEmpty() ? base : base + QLatin1Char('.') + extension;
 }
 
@@ -333,11 +337,13 @@ private:
         return lfnParts;
     }
 
-    void appendInvalid(const Dir& dir, std::uint32_t containingCluster, std::uint32_t slot, const std::string& reason)
+    void appendInvalid(const Dir& dir, std::uint32_t containingCluster, std::uint32_t slot,
+                       const std::string& reason, bool deletedMarkerObserved = false)
     {
         if (entries.size() >= limits.maximumEntries) { errorText = "FAT32 entry limit reached"; return; }
         FileEntry entry;
         entry.status = FileStatus::INVALID;
+        entry.deletedMarkerObserved = deletedMarkerObserved;
         entry.isValid = false;
         entry.confidence = FileRecordConfidence::Invalid;
         entry.volumeIdentity = identity;
@@ -386,7 +392,7 @@ private:
                     const std::uint32_t suspiciousCluster = ((std::uint32_t(u16(raw + 20)) << 16) | u16(raw + 26)) & 0x0FFFFFFF;
                     if (suspiciousCluster >= 2 && suspiciousCluster <= geometry.maximumCluster)
                         allocatedClusters.insert(suspiciousCluster);
-                    appendInvalid(dir, cluster, slot, "Reserved FAT32 directory attribute bits are set.");
+                    appendInvalid(dir, cluster, slot, "Reserved FAT32 directory attribute bits are set.", deleted);
                     if (!errorText.empty()) return;
                     continue;
                 }
@@ -408,11 +414,21 @@ private:
         bool lfnIsStructurallyValid = false;
         (void)decodeLongName(lfnParts, false, 0, lfnIsStructurallyValid);
         bool lfnValid = false;
-        QString name = decodeLongName(lfnParts, !deleted, shortChecksum(raw), lfnValid);
-        bool nameKnown = lfnValid;
-        if (!nameKnown && !deleted) {
-            name = decodeShortName(raw, false);
-            nameKnown = !name.isEmpty();
+        QString name;
+        bool nameKnown = false;
+        QString shortNameFragment;
+        if (deleted) {
+            // Deletion destroys the first short-name byte and normally each
+            // LFN order byte. The checksum cannot prove the missing byte, so
+            // never reverse-engineer a deleted original filename.
+            shortNameFragment = decodeShortName(raw,true);
+        } else {
+            name = decodeLongName(lfnParts,true,shortChecksum(raw),lfnValid);
+            nameKnown = lfnValid;
+            if (!nameKnown) {
+                name = decodeShortName(raw,false);
+                nameKnown = !name.isEmpty();
+            }
         }
         FileEntry entry;
         entry.volumeIdentity = identity;
@@ -426,9 +442,14 @@ private:
         entry.identity = volumeEntryIdentity(identity, dir.startCluster, containingCluster, slot);
         entry.entryIdentityAvailable = true;
         entry.status = deleted ? FileStatus::DELETED : FileStatus::EXISTING;
+        entry.deletedMarkerObserved = deleted;
         entry.isDirectory = directory;
         entry.name = nameKnown ? utf8(name) : std::string();
         entry.nameKnown = nameKnown;
+        if (deleted && !shortNameFragment.isEmpty()) {
+            entry.shortNameFragment = utf8(shortNameFragment);
+            entry.shortNameFragmentAvailable = true;
+        }
         if (dir.pathKnown) {
             entry.parentPath = utf8(dir.path);
             entry.parentPathKnown = true;
@@ -467,6 +488,8 @@ private:
                 entry.reason = !nameKnown ? "Existing entry has no validated filename." : "Existing entry has an invalid starting cluster.";
             }
         }
+        if (entry.status == FileStatus::INVALID)
+            entry.sizeKnown = false;
         entries.push_back(entry);
 
         if (!deleted) {
@@ -475,6 +498,7 @@ private:
                     entries.back().status = FileStatus::INVALID;
                     entries.back().confidence = FileRecordConfidence::Invalid;
                     entries.back().isValid = false;
+                    entries.back().sizeKnown = false;
                     entries.back().reason = "Existing directory has an invalid starting cluster.";
                 } else if (dir.depth < limits.maximumDepth) {
                     std::vector<std::uint32_t> directoryChain;
@@ -484,6 +508,7 @@ private:
                         entries.back().status = FileStatus::INVALID;
                         entries.back().confidence = FileRecordConfidence::Invalid;
                         entries.back().isValid = false;
+                        entries.back().sizeKnown = false;
                         entries.back().reason = "Existing directory cluster chain is malformed or truncated.";
                         return;
                     }
@@ -504,6 +529,7 @@ private:
                     entries.back().status = FileStatus::INVALID;
                     entries.back().confidence = FileRecordConfidence::Invalid;
                     entries.back().isValid = false;
+                    entries.back().sizeKnown = false;
                     entries.back().reason = "Existing file cluster chain is malformed or truncated.";
                 }
             } else if (!directory && startCluster >= 2 && startCluster <= geometry.maximumCluster) {
@@ -522,6 +548,7 @@ private:
                     FileEntry& entry = entries[index];
                     entry.confidence = FileRecordConfidence::Ambiguous;
                     entry.isValid = false;
+                    entry.sizeKnown = false;
                     entry.reason = allocatedClusters.count(cluster)
                         ? "Starting cluster is allocated to an existing entry; deleted metadata may have been reused. Operations are disabled."
                         : "Multiple deleted entries reference the same starting cluster; identity is ambiguous. Operations are disabled.";
@@ -645,6 +672,31 @@ private:
     std::uint32_t sector;
     HANDLE handle;
 };
+}
+
+bool isListedFileRecord(const FileEntry& entry)
+{
+    return !entry.isDirectory;
+}
+
+FileScanCounts aggregateFileEntries(const std::vector<FileEntry>& entries)
+{
+    FileScanCounts counts;
+    for (const FileEntry& entry : entries) {
+        if (entry.status == FileStatus::INVALID) ++counts.invalidRecords;
+        if (entry.confidence == FileRecordConfidence::Ambiguous) ++counts.ambiguousRecords;
+        if (entry.isDirectory) continue;
+        if (entry.status == FileStatus::EXISTING) {
+            ++counts.existingFiles;
+        } else if (entry.status == FileStatus::DELETED) {
+            ++counts.deletedEntryCandidates;
+            if (!entry.nameKnown) ++counts.deletedNamesUnknown;
+        } else if (entry.status == FileStatus::INVALID) {
+            ++counts.invalidFileRecords;
+            if (entry.deletedMarkerObserved && !entry.nameKnown) ++counts.deletedNamesUnknown;
+        }
+    }
+    return counts;
 }
 
 FileScanResult FileScanner::scanFat32(const std::shared_ptr<IReadOnlyVolumeReader>& reader,
