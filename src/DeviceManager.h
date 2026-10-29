@@ -7,8 +7,22 @@ struct DriveInfo {
     std::string mountPoint;
     std::string volumeLabel;
     std::string fileSystem;
+    std::string volumeGuid;
     unsigned long long capacityBytes = 0;
     bool capacityAvailable = false;
+    unsigned int logicalSectorSize = 0;
+    unsigned long long availableBytes = 0;
+    bool availableBytesAvailable = false;
+    std::string deviceType;
+    std::string physicalDiskNumber;
+    std::string deviceModel;
+    std::string busType;
+    std::string partitionNumber;
+    unsigned long long partitionOffsetBytes = 0;
+    unsigned long long partitionLengthBytes = 0;
+    bool partitionInfoAvailable = false;
+    unsigned long long physicalDiskCapacityBytes = 0;
+    bool physicalDiskCapacityAvailable = false;
     bool connected = false;
 };
 

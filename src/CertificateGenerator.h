@@ -19,23 +19,23 @@ struct CertificateData {
     std::string deviceModel;
     std::string serialNumber;
     std::string devicePath;
-    unsigned long long capacityGB;
+    unsigned long long capacityGB = 0;
     std::string fileSystem;
     
     // Wipe details
     std::string wipeMethod;
     std::string wipeStandard;     // DOD 5220.22-M, etc.
-    int passes;
-    unsigned long long bytesWiped;
+    int passes = 0;
+    unsigned long long bytesWiped = 0;
     
     // Verification
     std::string prewipeHash;       // SHA-256 hash before
     std::string postwipeHash;      // SHA-256 hash after
-    bool verificationPassed;
+    bool verificationPassed = false;
     std::string verificationNotes;
     
     // Status
-    bool success;
+    bool success = false;
     std::string status;
     std::string comments;
 };

@@ -5,6 +5,23 @@
 #include <random>
 #include <iomanip>
 #include <windows.h>
+#include <algorithm>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QString>
+
+namespace {
+QString qstr(const std::string& value) { return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size())); }
+std::string htmlEscape(const std::string& value) { return qstr(value).toHtmlEscaped().toUtf8().toStdString(); }
+bool evidenceSupportsSuccess(const CertificateData& data)
+{
+    // CertificateData is supplied by callers and is not linked to authenticated,
+    // persisted WipeResult/VerificationResult evidence. Never promote it to proof.
+    (void)data;
+    return false;
+}
+}
 
 std::string CertificateGenerator::generateCertificateID() {
     std::random_device rd;
@@ -35,7 +52,7 @@ std::string CertificateGenerator::getHTMLHeader(const CertificateData& data) {
     ss << "<html lang=\"en\">\n";
     ss << "<head>\n";
     ss << "    <meta charset=\"UTF-8\">\n";
-    ss << "    <title>WipeEngine Certificate - " << data.certificateID << "</title>\n";
+    ss << "    <title>DataGuard Operation Record - " << htmlEscape(data.certificateID) << "</title>\n";
     ss << "    <style>\n";
     ss << "        * { margin: 0; padding: 0; box-sizing: border-box; }\n";
     ss << "        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; }\n";
@@ -76,15 +93,16 @@ std::string CertificateGenerator::getHTMLHeader(const CertificateData& data) {
 
 std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     std::stringstream ss;
+    const bool evidenceSuccess = evidenceSupportsSuccess(data);
     
     // Header
     ss << "<div class=\"header\">\n";
-    ss << "    <h1>🔐 SECURE DATA WIPE CERTIFICATE</h1>\n";
-    ss << "    <p>WipeEngine - Certified Data Erasure</p>\n";
+    ss << "    <h1>DataGuard Operation Record</h1>\n";
+    ss << "    <p>Supplied operation details; not an independent certification</p>\n";
     ss << "</div>\n";
     
     ss << "<div class=\"certificate-id\">\n";
-    ss << "    <strong>Certificate ID: " << data.certificateID << "</strong>\n";
+    ss << "    <strong>Certificate ID: " << htmlEscape(data.certificateID) << "</strong>\n";
     ss << "</div>\n";
     
     // Status
@@ -92,13 +110,13 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "    <div class=\"row\">\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Status</label>\n";
-    ss << "            <value class=\"" << (data.success ? "status-success" : "status-failed") << "\">\n";
-    ss << "            " << data.status << "\n";
+    ss << "            <value class=\"" << (evidenceSuccess ? "status-success" : "status-failed") << "\">\n";
+    ss << "            " << (evidenceSuccess ? "Reported success with read-back evidence fields" : "Unverified or failed") << "\n";
     ss << "            </value>\n";
     ss << "        </div>\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Issue Date</label>\n";
-    ss << "            <value>" << data.issueDate << " " << data.issueTime << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.issueDate) << " " << htmlEscape(data.issueTime) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "</div>\n";
@@ -109,21 +127,21 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "    <div class=\"row\">\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Device Model</label>\n";
-    ss << "            <value>" << data.deviceModel << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.deviceModel) << "</value>\n";
     ss << "        </div>\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Serial Number</label>\n";
-    ss << "            <value>" << data.serialNumber << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.serialNumber) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "    <div class=\"row\">\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Device Path</label>\n";
-    ss << "            <value>" << data.devicePath << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.devicePath) << "</value>\n";
     ss << "        </div>\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>File System</label>\n";
-    ss << "            <value>" << data.fileSystem << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.fileSystem) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "    <div class=\"row\">\n";
@@ -144,11 +162,11 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "    <div class=\"row\">\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Algorithm</label>\n";
-    ss << "            <value>" << data.wipeMethod << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.wipeMethod) << "</value>\n";
     ss << "        </div>\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Standard</label>\n";
-    ss << "            <value>" << data.wipeStandard << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.wipeStandard) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "    <div class=\"row\">\n";
@@ -158,7 +176,7 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "        </div>\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Completion</label>\n";
-    ss << "            <value>" << data.completionDate << " " << data.completionTime << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.completionDate) << " " << htmlEscape(data.completionTime) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "</div>\n";
@@ -168,14 +186,14 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "    <h2>Verification & Integrity</h2>\n";
     ss << "    <div class=\"verification\">\n";
     ss << "        <h3>Pre-Wipe Hash (SHA-256)</h3>\n";
-    ss << "        <div class=\"hash-display\">" << data.prewipeHash << "</div>\n";
+    ss << "        <div class=\"hash-display\">" << htmlEscape(data.prewipeHash) << "</div>\n";
     ss << "        <h3>Post-Wipe Hash (SHA-256)</h3>\n";
-    ss << "        <div class=\"hash-display\">" << data.postwipeHash << "</div>\n";
+    ss << "        <div class=\"hash-display\">" << htmlEscape(data.postwipeHash) << "</div>\n";
     ss << "        <h3 style=\"margin-top: 15px;\">Verification Result</h3>\n";
-    ss << "        <value style=\"margin-top: 10px;\" class=\"" << (data.verificationPassed ? "status-success" : "status-failed") << "\">\n";
-    ss << "        " << (data.verificationPassed ? "✓ PASSED" : "✗ FAILED") << "\n";
+    ss << "        <value style=\"margin-top: 10px;\" class=\"" << (evidenceSuccess ? "status-success" : "status-failed") << "\">\n";
+    ss << "        " << (evidenceSuccess ? "READ-BACK EVIDENCE REPORTED" : "NOT VERIFIED") << "\n";
     ss << "        </value>\n";
-    ss << "        <p style=\"margin-top: 10px; color: #7f8c8d; font-size: 12px;\">" << data.verificationNotes << "</p>\n";
+    ss << "        <p style=\"margin-top: 10px; color: #7f8c8d; font-size: 12px;\">" << htmlEscape(data.verificationNotes) << "</p>\n";
     ss << "    </div>\n";
     ss << "</div>\n";
     
@@ -183,13 +201,11 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "<div class=\"section\">\n";
     ss << "    <h2>Compliance</h2>\n";
     ss << "    <div class=\"standards\">\n";
-    ss << "        <strong>Certifications & Standards:</strong>\n";
-    ss << "        ✓ DOD 5220.22-M (United States Department of Defense)<br>\n";
-    ss << "        ✓ NIST Guidelines<br>\n";
-    ss << "        ✓ ISO 27001 Data Protection<br>\n";
+    ss << "        <strong>Certification:</strong>\n";
+    ss << "        No independent certification or standards compliance is asserted.<br>\n";
     ss << "        <br>\n";
-    ss << "        <strong>Data Destruction Guarantee:</strong><br>\n";
-    ss << "        This certificate confirms that all data on the specified device has been securely wiped according to " << data.wipeStandard << " standards. The data is permanently unrecoverable.\n";
+    ss << "        <strong>Limitations:</strong><br>\n";
+    ss << "        This record reflects supplied fields only. It does not prove physical erasure, cover remapped or overprovisioned storage, or guarantee that data is unrecoverable.\n";
     ss << "    </div>\n";
     ss << "</div>\n";
     
@@ -199,17 +215,17 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
     ss << "    <div class=\"row\">\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Organization</label>\n";
-    ss << "            <value>" << data.organizationName << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.organizationName) << "</value>\n";
     ss << "        </div>\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Department</label>\n";
-    ss << "            <value>" << data.department << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.department) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "    <div class=\"row full\">\n";
     ss << "        <div class=\"field\">\n";
     ss << "            <label>Technician / Operator</label>\n";
-    ss << "            <value>" << data.technician << "</value>\n";
+    ss << "            <value>" << htmlEscape(data.technician) << "</value>\n";
     ss << "        </div>\n";
     ss << "    </div>\n";
     ss << "</div>\n";
@@ -219,14 +235,12 @@ std::string CertificateGenerator::getHTMLBody(const CertificateData& data) {
         ss << "<div class=\"section\">\n";
         ss << "    <h2>Additional Notes</h2>\n";
         ss << "    <div class=\"field\">\n";
-        ss << "        <value>" << data.comments << "</value>\n";
+        ss << "        <value>" << htmlEscape(data.comments) << "</value>\n";
         ss << "    </div>\n";
         ss << "</div>\n";
     }
     
-    ss << "<div class=\"seal\">\n";
-    ss << "    ✓\n";
-    ss << "</div>\n";
+    ss << "<div class=\"footer\">This operation record is not digitally signed.</div>\n";
     
     return ss.str();
 }
@@ -241,12 +255,13 @@ std::string CertificateGenerator::generateHTML(const CertificateData& data) {
 
 std::string CertificateGenerator::generateText(const CertificateData& data) {
     std::stringstream ss;
+    const bool evidenceSuccess = evidenceSupportsSuccess(data);
     ss << "╔════════════════════════════════════════════════════════════════════════════════╗\n";
-    ss << "║                  SECURE DATA WIPE CERTIFICATE                                 ║\n";
-    ss << "║                      WipeEngine - Certified                                   ║\n";
+    ss << "║                    DataGuard Operation Record                                 ║\n";
+    ss << "║              Supplied details; not an independent certification               ║\n";
     ss << "╠════════════════════════════════════════════════════════════════════════════════╣\n";
     ss << "║ Certificate ID: " << std::left << std::setw(68) << data.certificateID << "║\n";
-    ss << "║ Status: " << std::setw(77) << (data.success ? "SUCCESS ✓" : "FAILED ✗") << "║\n";
+    ss << "║ Status: " << std::setw(77) << (evidenceSuccess ? "REPORTED SUCCESS; EVIDENCE FIELDS PRESENT" : "UNVERIFIED OR FAILED") << "║\n";
     ss << "╠════════════════════════════════════════════════════════════════════════════════╣\n";
     ss << "║ DEVICE INFORMATION\n";
     ss << "║ Model: " << data.deviceModel << "\n";
@@ -261,50 +276,58 @@ std::string CertificateGenerator::generateText(const CertificateData& data) {
     ss << "║ Bytes Wiped: " << data.bytesWiped << "\n";
     ss << "╠════════════════════════════════════════════════════════════════════════════════╣\n";
     ss << "║ VERIFICATION\n";
-    ss << "║ Verification: " << (data.verificationPassed ? "PASSED ✓" : "FAILED ✗") << "\n";
+    ss << "║ Verification: " << (evidenceSuccess ? "READ-BACK EVIDENCE REPORTED" : "NOT VERIFIED") << "\n";
+    ss << "║ No physical erasure, standards compliance, or permanent unrecoverability is guaranteed.\n";
     ss << "╚════════════════════════════════════════════════════════════════════════════════╝\n";
     return ss.str();
 }
 
 std::string CertificateGenerator::generateJSON(const CertificateData& data) {
-    std::stringstream ss;
-    ss << "{\n";
-    ss << "  \"certificate\": {\n";
-    ss << "    \"id\": \"" << data.certificateID << "\",\n";
-    ss << "    \"version\": \"1.0.0\",\n";
-    ss << "    \"issued\": \"" << data.issueDate << "T" << data.issueTime << "Z\",\n";
-    ss << "    \"completed\": \"" << data.completionDate << "T" << data.completionTime << "Z\",\n";
-    ss << "    \"status\": \"" << data.status << "\",\n";
-    ss << "    \"success\": " << (data.success ? "true" : "false") << "\n";
-    ss << "  },\n";
-    ss << "  \"device\": {\n";
-    ss << "    \"model\": \"" << data.deviceModel << "\",\n";
-    ss << "    \"serialNumber\": \"" << data.serialNumber << "\",\n";
-    ss << "    \"path\": \"" << data.devicePath << "\",\n";
-    ss << "    \"capacityGB\": " << data.capacityGB << ",\n";
-    ss << "    \"fileSystem\": \"" << data.fileSystem << "\"\n";
-    ss << "  },\n";
-    ss << "  \"wipeMethod\": {\n";
-    ss << "    \"algorithm\": \"" << data.wipeMethod << "\",\n";
-    ss << "    \"standard\": \"" << data.wipeStandard << "\",\n";
-    ss << "    \"passes\": " << data.passes << ",\n";
-    ss << "    \"bytesWiped\": " << data.bytesWiped << "\n";
-    ss << "  },\n";
-    ss << "  \"verification\": {\n";
-    ss << "    \"prewipeHash\": \"" << data.prewipeHash << "\",\n";
-    ss << "    \"postwipeHash\": \"" << data.postwipeHash << "\",\n";
-    ss << "    \"passed\": " << (data.verificationPassed ? "true" : "false") << ",\n";
-    ss << "    \"notes\": \"" << data.verificationNotes << "\"\n";
-    ss << "  },\n";
-    ss << "  \"organization\": {\n";
-    ss << "    \"name\": \"" << data.organizationName << "\",\n";
-    ss << "    \"department\": \"" << data.department << "\",\n";
-    ss << "    \"technician\": \"" << data.technician << "\"\n";
-    ss << "  }\n";
-    ss << "}\n";
-    return ss.str();
-}
+    const bool evidenceSuccess = evidenceSupportsSuccess(data);
+    QJsonObject certificate;
+    certificate.insert(QStringLiteral("id"), qstr(data.certificateID));
+    certificate.insert(QStringLiteral("version"), QStringLiteral("1.0.0"));
+    certificate.insert(QStringLiteral("issued"), qstr(data.issueDate) + QLatin1Char('T') + qstr(data.issueTime));
+    certificate.insert(QStringLiteral("completed"), qstr(data.completionDate) + QLatin1Char('T') + qstr(data.completionTime));
+    certificate.insert(QStringLiteral("reportedStatus"), qstr(data.status));
+    certificate.insert(QStringLiteral("success"), evidenceSuccess);
+    certificate.insert(QStringLiteral("verificationEvidencePresent"), evidenceSuccess);
 
+    QJsonObject device;
+    device.insert(QStringLiteral("model"), qstr(data.deviceModel));
+    device.insert(QStringLiteral("serialNumber"), qstr(data.serialNumber));
+    device.insert(QStringLiteral("path"), qstr(data.devicePath));
+    device.insert(QStringLiteral("capacityGB"), QString::number(data.capacityGB));
+    device.insert(QStringLiteral("fileSystem"), qstr(data.fileSystem));
+
+    QJsonObject wipe;
+    wipe.insert(QStringLiteral("algorithm"), qstr(data.wipeMethod));
+    wipe.insert(QStringLiteral("reportedStandard"), qstr(data.wipeStandard));
+    wipe.insert(QStringLiteral("passes"), data.passes);
+    wipe.insert(QStringLiteral("bytesWiped"), QString::number(data.bytesWiped));
+
+    QJsonObject verification;
+    verification.insert(QStringLiteral("prewipeHash"), qstr(data.prewipeHash));
+    verification.insert(QStringLiteral("postwipeHash"), qstr(data.postwipeHash));
+    verification.insert(QStringLiteral("reportedPassed"), data.verificationPassed);
+    verification.insert(QStringLiteral("notes"), qstr(data.verificationNotes));
+
+    QJsonObject organization;
+    organization.insert(QStringLiteral("name"), qstr(data.organizationName));
+    organization.insert(QStringLiteral("department"), qstr(data.department));
+    organization.insert(QStringLiteral("technician"), qstr(data.technician));
+    organization.insert(QStringLiteral("comments"), qstr(data.comments));
+
+    QJsonObject root;
+    root.insert(QStringLiteral("recordType"), QStringLiteral("unverified-operation-record"));
+    root.insert(QStringLiteral("certificate"), certificate);
+    root.insert(QStringLiteral("device"), device);
+    root.insert(QStringLiteral("wipeMethod"), wipe);
+    root.insert(QStringLiteral("verification"), verification);
+    root.insert(QStringLiteral("organization"), organization);
+    root.insert(QStringLiteral("limitations"), QStringLiteral("Supplied fields are not independently authenticated. No claim of physical erasure, standards certification, or permanent unrecoverability is made."));
+    return QJsonDocument(root).toJson(QJsonDocument::Indented).toStdString();
+}
 bool CertificateGenerator::saveCertificate(const CertificateData& data, 
                                           const std::string& format) {
     std::string filename;
@@ -324,6 +347,11 @@ bool CertificateGenerator::saveCertificate(const CertificateData& data,
         return false;
     }
     
+    if (data.certificateID.empty() || data.certificateID.size() > 80 ||
+        !std::all_of(data.certificateID.begin(), data.certificateID.end(), [](unsigned char ch) {
+            return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                   (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+        })) return false;
     filename = "Certificate_" + data.certificateID + ext;
     
     std::ofstream file(filename);

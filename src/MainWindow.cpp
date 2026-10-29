@@ -2,6 +2,7 @@
 #include "ImageBackgroundWidget.h"
 
 #include <QFrame>
+#include <QHash>
 #include <QGraphicsOpacityEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -19,6 +20,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <memory>
+#include <atomic>
 
 namespace {
 const QString cardStyle = QStringLiteral(
@@ -81,8 +83,21 @@ QString deviceTitle(const DriveInfo& device)
 {
     const QString mount = QString::fromStdString(device.mountPoint).trimmed();
     const QString label = QString::fromStdString(device.volumeLabel).trimmed();
-    const QString name = label.isEmpty() ? QStringLiteral("Removable volume") : label;
+    const QString model = QString::fromUtf8(device.deviceModel.data(), static_cast<qsizetype>(device.deviceModel.size())).trimmed();
+    const QString name = !model.isEmpty() ? model : (!label.isEmpty() ? label : QStringLiteral("Removable volume"));
     return mount.isEmpty() ? name : QStringLiteral("%1 (%2)").arg(name, mount.left(2));
+}
+
+QString metadataValue(const std::string& value)
+{
+    const QString result = QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size())).trimmed();
+    return result.isEmpty() ? QStringLiteral("Unknown") : result;
+}
+
+QString volumeIdentity(const DriveInfo& device)
+{
+    const QString value = metadataValue(device.volumeGuid);
+    return value == QStringLiteral("Unknown") ? QString() : value.toLower();
 }
 }
 
@@ -163,7 +178,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     m_pages->setStyleSheet(QStringLiteral("QStackedWidget { background:transparent; }"));
     m_pages->addWidget(buildDashboardPage());
     m_pages->addWidget(buildDevicesPage());
-    m_pages->addWidget(buildPlaceholderPage(QStringLiteral("Scan Results"), QStringLiteral("No scan results are available yet. Connect a device and perform a supported scan when that feature is enabled."), QStringLiteral("⌕")));
+    m_pages->addWidget(buildScanResultsPage());
     m_pages->addWidget(buildOperationsPage());
     m_pages->addWidget(buildPlaceholderPage(QStringLiteral("Activity Log"), QStringLiteral("No activity recorded yet. Completed operations will appear here when audit logging is integrated."), QStringLiteral("◷")));
     m_pages->addWidget(buildPlaceholderPage(QStringLiteral("Certificates"), QStringLiteral("No certificates generated yet. Certificates will appear here once operation records and verification evidence are integrated."), QStringLiteral("▤")));
@@ -186,6 +201,15 @@ void MainWindow::setSignedInUser(const QString& username)
 MainWindow::~MainWindow()
 {
     stopScanAnimation();
+    if (m_fileScanCancelled)
+        m_fileScanCancelled->store(true);
+    if (m_fileScanThread) {
+        disconnect(m_fileScanThread, nullptr, this, nullptr);
+        if (m_fileScanThread->isRunning())
+            m_fileScanThread->wait();
+        delete m_fileScanThread;
+        m_fileScanThread = nullptr;
+    }
     if (m_scanThread) {
         disconnect(m_scanThread, nullptr, this, nullptr);
         if (m_scanThread->isRunning())
@@ -349,10 +373,32 @@ QWidget* MainWindow::buildDashboardPage()
     selectedLayout->addWidget(m_selectedDeviceName);
     m_selectedDeviceDetails = bodyText(QString(),m_selectedDevicePanel);
     selectedLayout->addWidget(m_selectedDeviceDetails);
+    m_deviceDetailsToggle = new QToolButton(m_selectedDevicePanel);
+    m_deviceDetailsToggle->setText(QStringLiteral("Device Details  ▾"));
+    m_deviceDetailsToggle->setCheckable(true);
+    m_deviceDetailsToggle->setStyleSheet(QStringLiteral("QToolButton { color:#72dafa; background:transparent; border:0; text-align:left; font-weight:700; padding:4px 0; }"));
+    selectedLayout->addWidget(m_deviceDetailsToggle);
+    m_technicalDeviceDetails = bodyText(QString(),m_selectedDevicePanel);
+    m_technicalDeviceDetails->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_technicalDeviceDetails->hide();
+    selectedLayout->addWidget(m_technicalDeviceDetails);
+    connect(m_deviceDetailsToggle,&QToolButton::toggled,this,[this](bool expanded) {
+        m_technicalDeviceDetails->setVisible(expanded);
+        m_deviceDetailsToggle->setText(expanded ? QStringLiteral("Device Details  ▴") : QStringLiteral("Device Details  ▾"));
+    });
     auto* nextStepTitle = heading(QStringLiteral("Next step"),m_selectedDevicePanel);
     nextStepTitle->setStyleSheet(QStringLiteral("color:#75d9f5; font-size:13px; font-weight:700;"));
     selectedLayout->addWidget(nextStepTitle);
-    selectedLayout->addWidget(bodyText(QStringLiteral("Content scanning and storage operations are not enabled yet. Device detection only reads connection and volume metadata."),m_selectedDevicePanel));
+    selectedLayout->addWidget(bodyText(QStringLiteral("FAT32 deleted-entry identification is read-only. It does not establish recoverability or enable storage operations."),m_selectedDevicePanel));
+    auto* identifyEntries = new QPushButton(QStringLiteral("Identify FAT32 Entries"),m_selectedDevicePanel);
+    identifyEntries->setMinimumHeight(38);
+    identifyEntries->setStyleSheet(QStringLiteral("QPushButton { color:white; background:#1677c8; border:0; border-radius:8px; padding:8px 12px; font-weight:700; } QPushButton:hover { background:#2395dc; }"));
+    selectedLayout->addWidget(identifyEntries);
+    connect(identifyEntries,&QPushButton::clicked,this,[this]() {
+        m_navigationButtons[2]->setChecked(true);
+        navigateTo(2,QStringLiteral("Scan Results"));
+        startDeletedEntryScan();
+    });
     m_selectedDevicePanel->hide();
     selectionLayout->addWidget(m_selectedDevicePanel,1);
     selectionLayout->addStretch();
@@ -436,6 +482,151 @@ QWidget* MainWindow::buildDevicesPage()
     });
     return page;
 }
+
+QWidget* MainWindow::buildScanResultsPage()
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(8,8,10,12);
+    layout->setSpacing(12);
+    auto* intro = makeCard(page);
+    auto* introLayout = new QVBoxLayout(intro);
+    introLayout->setContentsMargins(18,14,18,14);
+    introLayout->setSpacing(8);
+    introLayout->addWidget(heading(QStringLiteral("FAT32 deleted-entry identification"),intro));
+    m_fileScanSource = bodyText(QStringLiteral("Select a uniquely identified device from the Dashboard first."),intro);
+    introLayout->addWidget(m_fileScanSource);
+    m_fileScanStatus = bodyText(QStringLiteral("No identification scan has been run."),intro);
+    introLayout->addWidget(m_fileScanStatus);
+    auto* controls = new QHBoxLayout;
+    m_fileScanButton = new QPushButton(QStringLiteral("Identify FAT32 Entries"),intro);
+    m_fileScanButton->setMinimumHeight(40);
+    m_fileScanButton->setStyleSheet(QStringLiteral("QPushButton { color:white; background:#1677c8; border:0; border-radius:8px; padding:8px 14px; font-weight:700; } QPushButton:hover { background:#2395dc; } QPushButton:disabled { background:#465b70; color:#aab8c5; }"));
+    connect(m_fileScanButton,&QPushButton::clicked,this,&MainWindow::startDeletedEntryScan);
+    controls->addWidget(m_fileScanButton);
+    m_fileScanCancelButton = new QPushButton(QStringLiteral("Cancel"),intro);
+    m_fileScanCancelButton->setEnabled(false);
+    connect(m_fileScanCancelButton,&QPushButton::clicked,this,[this]() {
+        if (m_fileScanCancelled) {
+            m_fileScanCancelled->store(true);
+            m_fileScanStatus->setText(QStringLiteral("Cancelling read-only identification…"));
+            m_fileScanCancelButton->setEnabled(false);
+        }
+    });
+    controls->addWidget(m_fileScanCancelButton);
+    controls->addStretch();
+    introLayout->addLayout(controls);
+    layout->addWidget(intro);
+
+    auto* results = makeCard(page);
+    auto* resultsLayout = new QVBoxLayout(results);
+    resultsLayout->setContentsMargins(16,14,16,14);
+    resultsLayout->setSpacing(8);
+    resultsLayout->addWidget(heading(QStringLiteral("Identified entries"),results));
+    auto* note = bodyText(QStringLiteral("Deleted directory contents are not traversed. A deleted entry is only a metadata candidate; this does not prove its contents are recoverable. All storage operations remain disabled."),results);
+    resultsLayout->addWidget(note);
+    m_fileResultsList = new QListWidget(results);
+    m_fileResultsList->setObjectName(QStringLiteral("fat32IdentifiedEntries"));
+    m_fileResultsList->setWordWrap(true);
+    m_fileResultsList->setStyleSheet(QStringLiteral("QListWidget { color:#dbe9f5; background:rgba(2,11,29,130); border:1px solid rgba(122,177,211,55); border-radius:8px; padding:5px; } QListWidget::item { padding:9px; border-bottom:1px solid rgba(122,177,211,35); } QListWidget::item:selected { background:rgba(21,119,171,120); }"));
+    resultsLayout->addWidget(m_fileResultsList,1);
+    layout->addWidget(results,1);
+    return page;
+}
+
+void MainWindow::startDeletedEntryScan()
+{
+    if (m_fileScanInProgress)
+        return;
+    if (!m_hasSelectedDrive || m_selectedDeviceIdentity.isEmpty() ||
+        volumeIdentity(m_selectedDriveInfo) != m_selectedDeviceIdentity) {
+        m_fileScanStatus->setText(QStringLiteral("No current, uniquely identified volume is selected. Return to Dashboard and rescan devices."));
+        return;
+    }
+    m_fileScanInProgress = true;
+    m_fileScanCancelled = std::make_shared<std::atomic_bool>(false);
+    m_fileScanButton->setEnabled(false);
+    m_fileScanCancelButton->setEnabled(true);
+    m_fileResultsList->clear();
+    const QString sourceLabel = QStringLiteral("Source volume: %1 · %2 · %3")
+        .arg(QString::fromStdString(m_selectedDriveInfo.volumeLabel).trimmed().isEmpty()
+                 ? QStringLiteral("Unnamed volume") : QString::fromStdString(m_selectedDriveInfo.volumeLabel),
+             QString::fromStdString(m_selectedDriveInfo.mountPoint),
+             QString::fromStdString(m_selectedDriveInfo.fileSystem));
+    m_fileScanSource->setText(sourceLabel);
+    m_fileScanStatus->setText(QStringLiteral("Reading FAT32 directory metadata…"));
+
+    const DriveInfo selected = m_selectedDriveInfo;
+    const std::string expected = m_selectedDeviceIdentity.toStdString();
+    auto cancelled = m_fileScanCancelled;
+    auto result = std::make_shared<FileScanResult>();
+    auto openError = std::make_shared<std::string>();
+    QThread* worker = QThread::create([selected, expected, cancelled, result, openError]() {
+        auto reader = FileScanner::openMountedVolumeReadOnly(selected, *openError);
+        if (!reader) {
+            result->status = FileScanStatus::Error;
+            result->errorMessage = *openError;
+            return;
+        }
+        *result = FileScanner::scanFat32(reader, expected, FileScanner::Limits{},
+                                         [cancelled]() { return cancelled->load(); });
+    });
+    m_fileScanThread = worker;
+    connect(worker,&QThread::finished,this,[this,worker,result,sourceLabel]() {
+        if (m_fileScanThread == worker)
+            m_fileScanThread = nullptr;
+        worker->deleteLater();
+        completeDeletedEntryScan(*result,sourceLabel);
+    });
+    worker->start();
+}
+
+void MainWindow::completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume)
+{
+    m_fileScanInProgress = false;
+    m_fileScanButton->setEnabled(true);
+    m_fileScanCancelButton->setEnabled(false);
+    m_fileScanSource->setText(sourceVolume);
+    m_fileResultsList->clear();
+    if (result.status != FileScanStatus::Success) {
+        QString message = QString::fromStdString(result.errorMessage);
+        if (message.isEmpty()) message = QStringLiteral("FAT32 identification could not be completed.");
+        m_fileScanStatus->setText(message);
+        m_fileScanCancelled.reset();
+        return;
+    }
+    int deletedCount = 0;
+    for (const FileEntry& entry : result.entries) {
+        if (entry.status == FileStatus::DELETED) ++deletedCount;
+        const QString state = entry.status == FileStatus::DELETED ? QStringLiteral("Deleted entry candidate")
+            : entry.status == FileStatus::INVALID ? QStringLiteral("Invalid / ambiguous")
+            : QStringLiteral("Existing entry");
+        const QString name = entry.nameKnown && !entry.name.empty()
+            ? QString::fromUtf8(entry.name.data(),static_cast<qsizetype>(entry.name.size()))
+            : QStringLiteral("Unknown name");
+        const QString path = entry.fullPath.empty() ? name
+            : QString::fromUtf8(entry.fullPath.data(),static_cast<qsizetype>(entry.fullPath.size()));
+        const QString location = entry.fullPath.empty()
+            ? QStringLiteral("Parent directory: %1").arg(!entry.parentPathKnown
+                  ? QStringLiteral("Unknown")
+                  : entry.parentPath.empty() ? QStringLiteral("volume root")
+                  : QString::fromUtf8(entry.parentPath.data(),static_cast<qsizetype>(entry.parentPath.size())))
+            : path;
+        const QString size = entry.sizeKnown ? QStringLiteral("%1 bytes").arg(entry.sizeBytes) : QStringLiteral("Unknown size");
+        auto* item = new QListWidgetItem(QStringLiteral("%1\n%2 · %3 · %4")
+            .arg(state,location,size,QString::fromStdString(entry.reason)),m_fileResultsList);
+        item->setToolTip(QString::fromStdString(entry.reason));
+        item->setData(Qt::UserRole,QString::fromStdString(entry.identity));
+        item->setFlags(item->flags() & ~Qt::ItemIsSelectable);
+        item->setSizeHint(QSize(100,72));
+    }
+    m_fileScanStatus->setText(QStringLiteral("Identification complete: %1 deleted-entry candidate(s), %2 total directory record(s). No recoverability claim is made.")
+                                   .arg(deletedCount).arg(result.entries.size()));
+    if (result.entries.empty())
+        m_fileScanStatus->setText(QStringLiteral("No directory entries were identified in the supported FAT32 metadata."));
+    m_fileScanCancelled.reset();
+}
+
 void MainWindow::startDeviceScan()
 {
     if (m_deviceScanInProgress)
@@ -443,6 +634,16 @@ void MainWindow::startDeviceScan()
 
     m_deviceScanInProgress = true;
     m_detectedDevices.clear();
+    m_selectedDeviceIdentity.clear();
+    m_hasSelectedDrive = false;
+    if (m_deviceList) {
+        m_deviceList->clear();
+        m_deviceList->setCurrentRow(-1);
+    }
+    if (m_selectedDevicePanel)
+        m_selectedDevicePanel->hide();
+    if (m_selectionPrompt)
+        m_selectionPrompt->show();
     if (m_scanButton) {
         m_scanButton->setEnabled(false);
         m_scanButton->setText(QStringLiteral("Scanning…"));
@@ -460,15 +661,20 @@ void MainWindow::startDeviceScan()
         if (m_scanThread == worker)
             m_scanThread = nullptr;
         worker->deleteLater();
-        m_deviceScanInProgress = false;
-        if (m_scanButton) {
-            m_scanButton->setEnabled(true);
-            m_scanButton->setText(QStringLiteral("Scan for Devices"));
-        }
-        stopScanAnimation();
-        displayDeviceResults(*result);
+        completeDeviceScan(*result);
     });
     worker->start();
+}
+
+void MainWindow::completeDeviceScan(const DeviceEnumerationResult& result)
+{
+    m_deviceScanInProgress = false;
+    if (m_scanButton) {
+        m_scanButton->setEnabled(true);
+        m_scanButton->setText(QStringLiteral("Scan for Devices"));
+    }
+    stopScanAnimation();
+    displayDeviceResults(result);
 }
 
 void MainWindow::stopScanAnimation()
@@ -497,23 +703,34 @@ void MainWindow::displayDeviceResults(const DeviceEnumerationResult& result)
 
     m_deviceList->blockSignals(true);
     m_deviceList->clear();
+    QHash<QString, int> identityCounts;
+    for (const DriveInfo& device : m_detectedDevices) {
+        const QString identity = volumeIdentity(device);
+        if (!identity.isEmpty())
+            identityCounts[identity] += 1;
+    }
     for (std::size_t index = 0; index < m_detectedDevices.size(); ++index) {
         const DriveInfo& device = m_detectedDevices[index];
-        const QString fileSystem = device.fileSystem.empty()
-            ? QStringLiteral("Unknown")
-            : QString::fromStdString(device.fileSystem);
+        const QString fileSystem = metadataValue(device.fileSystem);
         const QString capacity = formatCapacity(device);
         auto* item = new QListWidgetItem(
-            QStringLiteral("%1\n%2  ·  %3")
+            QStringLiteral("%1\nMount: %2  ·  Capacity: %3  ·  %4")
                 .arg(deviceTitle(device),
-                     QStringLiteral("Capacity: %1").arg(capacity),
-                     QStringLiteral("File system: %1").arg(fileSystem)),
+                     metadataValue(device.mountPoint),
+                     capacity,
+                     fileSystem),
             m_deviceList);
-        item->setData(Qt::UserRole, static_cast<qulonglong>(index));
+        const QString identity = volumeIdentity(device);
+        item->setData(Qt::UserRole, identity);
+        if (identity.isEmpty() || identityCounts.value(identity) != 1) {
+            item->setFlags(item->flags() & ~Qt::ItemIsSelectable);
+            item->setToolTip(QStringLiteral("This volume has no unique verified identifier and cannot be selected safely."));
+        }
         item->setSizeHint(QSize(item->sizeHint().width(), 66));
     }
     m_deviceList->setCurrentRow(-1);
     m_deviceList->blockSignals(false);
+    m_selectionPrompt->setText(QStringLiteral("Select a detected device to review its available details."));
     m_selectionPrompt->show();
     m_selectedDevicePanel->hide();
     m_scanStatusLabel->setText(QStringLiteral("Device detected"));
@@ -524,26 +741,67 @@ void MainWindow::displayDeviceResults(const DeviceEnumerationResult& result)
 
 void MainWindow::selectDeviceRow(int row)
 {
-    if (row < 0 || row >= static_cast<int>(m_detectedDevices.size())) {
+    if (row < 0 || row >= m_deviceList->count()) {
         m_selectedDevicePanel->hide();
         m_selectionPrompt->show();
+        m_selectedDeviceIdentity.clear();
         return;
     }
 
-    const DriveInfo& device = m_detectedDevices[static_cast<std::size_t>(row)];
-    const QString mount = device.mountPoint.empty()
-        ? QStringLiteral("Unknown")
-        : QString::fromStdString(device.mountPoint);
-    const QString fileSystem = device.fileSystem.empty()
-        ? QStringLiteral("Unknown")
-        : QString::fromStdString(device.fileSystem);
+    const QString identity = m_deviceList->item(row)->data(Qt::UserRole).toString();
+    int matchingIndex = -1;
+    for (std::size_t index = 0; index < m_detectedDevices.size(); ++index) {
+        if (volumeIdentity(m_detectedDevices[index]) == identity) {
+            if (matchingIndex >= 0) {
+                m_selectedDevicePanel->hide();
+                m_selectionPrompt->setText(QStringLiteral("The volume identifier is ambiguous. Rescan before continuing."));
+                m_selectionPrompt->show();
+                m_selectedDeviceIdentity.clear();
+                return;
+            }
+            matchingIndex = static_cast<int>(index);
+        }
+    }
+    if (identity.isEmpty() || matchingIndex < 0) {
+        m_selectedDevicePanel->hide();
+        m_selectionPrompt->setText(QStringLiteral("This volume has no unique verified identifier. Rescan before continuing."));
+        m_selectionPrompt->show();
+        m_selectedDeviceIdentity.clear();
+        return;
+    }
+    m_selectedDeviceIdentity = identity;
+    const DriveInfo& device = m_detectedDevices[static_cast<std::size_t>(matchingIndex)];
+    m_selectedDriveInfo = device;
+    m_hasSelectedDrive = true;
+    const QString mount = metadataValue(device.mountPoint);
+    const QString fileSystem = metadataValue(device.fileSystem);
+    const QString available = device.availableBytesAvailable
+        ? QStringLiteral("%1 GB").arg(static_cast<double>(device.availableBytes) / 1.0e9, 0, 'f', 1)
+        : QStringLiteral("Unknown");
+    const QString physicalCapacity = device.physicalDiskCapacityAvailable
+        ? QStringLiteral("%1 GB").arg(static_cast<double>(device.physicalDiskCapacityBytes) / 1.0e9, 0, 'f', 1)
+        : QStringLiteral("Unknown");
     m_selectedDeviceName->setText(deviceTitle(device));
     m_selectedDeviceDetails->setText(
-        QStringLiteral("Connection: %1\nMount point: %2\nCapacity: %3\nFile system: %4")
-            .arg(device.connected ? QStringLiteral("Connected") : QStringLiteral("Unknown"),
+        QStringLiteral("Volume label: %1\nMount point: %2\nVolume capacity: %3\nAvailable free space: %4\nFile system: %5\nDevice type: %6\nConnection: %7")
+            .arg(metadataValue(device.volumeLabel),
                  mount,
                  formatCapacity(device),
-                 fileSystem));
+                 available,
+                 fileSystem,
+                 metadataValue(device.deviceType),
+                 device.connected ? QStringLiteral("Connected") : QStringLiteral("Unknown")));
+    m_technicalDeviceDetails->setText(
+        QStringLiteral("Volume ID: %1\nPhysical disk: %2\nModel: %3\nBus type: %4\nPartition number: %5\nPartition offset: %6\nPartition length: %7\nPhysical disk capacity: %8")
+            .arg(metadataValue(device.volumeGuid),
+                 metadataValue(device.physicalDiskNumber),
+                 metadataValue(device.deviceModel),
+                 metadataValue(device.busType),
+                 metadataValue(device.partitionNumber),
+                 device.partitionInfoAvailable ? QStringLiteral("%1 bytes").arg(device.partitionOffsetBytes) : QStringLiteral("Unknown"),
+                 device.partitionInfoAvailable ? QStringLiteral("%1 bytes").arg(device.partitionLengthBytes) : QStringLiteral("Unknown"),
+                 physicalCapacity));
+    m_deviceDetailsToggle->setChecked(false);
 
     m_selectionPrompt->hide();
     m_selectedDevicePanel->show();

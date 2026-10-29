@@ -15,7 +15,9 @@ add_executable(WipeEngine WIN32
     src/MainWindow.cpp
     src/DeviceManager.cpp
     src/WipeEngine.cpp
+    src/StorageSafety.cpp
     src/FileScanner.cpp
+    src/Fat32Scanner.cpp
     src/Logger.cpp
     src/CertificateGenerator.cpp
     src/FeatureExtractor.cpp
@@ -46,10 +48,34 @@ if(BUILD_TESTING)
         tests/DashboardStateTests.cpp
         src/MainWindow.cpp
         src/DeviceManager.cpp
+        src/Fat32Scanner.cpp
         src/ImageBackgroundWidget.cpp
         resources.qrc
     )
     target_link_libraries(DashboardStateTests PRIVATE Qt6::Widgets)
     add_test(NAME DashboardStateTests COMMAND DashboardStateTests)
     set_tests_properties(DashboardStateTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(WipeSafetyTests
+        tests/WipeSafetyTests.cpp
+        src/WipeEngine.cpp
+        src/StorageSafety.cpp
+    )
+    target_link_libraries(WipeSafetyTests PRIVATE Qt6::Core)
+    add_test(NAME WipeSafetyTests COMMAND WipeSafetyTests)
+
+    add_executable(CertificateGeneratorTests
+        tests/CertificateGeneratorTests.cpp
+        src/CertificateGenerator.cpp
+    )
+    target_link_libraries(CertificateGeneratorTests PRIVATE Qt6::Core)
+    add_test(NAME CertificateGeneratorTests COMMAND CertificateGeneratorTests)
+
+    add_executable(FileScannerSafetyTests
+        tests/FileScannerSafetyTests.cpp
+        src/FileScanner.cpp
+        src/Fat32Scanner.cpp
+    )
+    target_link_libraries(FileScannerSafetyTests PRIVATE Qt6::Core)
+    add_test(NAME FileScannerSafetyTests COMMAND FileScannerSafetyTests)
 endif()

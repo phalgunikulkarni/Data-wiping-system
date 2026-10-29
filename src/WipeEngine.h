@@ -1,13 +1,10 @@
 #pragma once
-#include <windows.h>
 #include <string>
 #include <vector>
 #include <utility>
 #include <functional>
 #include <QString>
-#include <QFile>
-
-class QCryptographicHash;
+#include "StorageSafety.h"
 
 enum class WipeMethod {
     ZEROS,
@@ -22,7 +19,8 @@ enum class WipeStatus {
     InvalidExtent,
     OpenFailure,
     LockFailure,
-    WriteFailure
+    WriteFailure,
+    Unsupported
 };
 
 enum class VerificationStatus {
@@ -43,13 +41,15 @@ struct ExtentReadResult {
 };
 
 struct WipeResult {
-    bool success;
-    unsigned long long bytesWiped;
-    unsigned long long totalBytes;
+    bool success = false;
+    unsigned long long bytesWiped = 0;
+    unsigned long long totalBytes = 0;
     std::string errorMessage;
     std::string finalDataSha256;
-    int passesCompleted;
+    int passesCompleted = 0;
     WipeStatus status = WipeStatus::Success;
+    bool verificationPerformed = false;
+    bool verified = false;
 };
 
 
@@ -86,6 +86,13 @@ public:
         const std::string& expectedFinalSha256
     );
 
+    WipeResult wipeVolumeExtents(
+        const StorageTargetDescriptor& target,
+        const std::vector<VolumeRelativeExtent>& extents,
+        WipeMethod method,
+        IStorageDevice& device,
+        std::function<void(int, int, int)> progressCallback = {});
+
     ExtentReadResult readExtents(
         const std::string& physicalPath,
         const std::vector<std::pair<unsigned long long, unsigned long long>>& extents,
@@ -108,27 +115,4 @@ public:
     WipeMethod method
     );
 
-private:
-    bool verifyZeroPass(
-    const QString& filePath
-    );
-
-    bool writePass(
-        HANDLE hDrive,
-        unsigned long long totalBytes,
-        unsigned char fillByte,
-        bool useRandom,
-        int passNumber,
-        int totalPasses,
-        std::function<void(int, int, int)> progressCallback,
-        unsigned long long startOffset = 0,
-        QCryptographicHash* finalPassHash = nullptr
-    );
-
-    bool verifyWipe(
-        HANDLE hDrive,
-        unsigned long long startOffset,
-        unsigned long long totalBytes,
-        unsigned char expectedByte
-    );
 };
