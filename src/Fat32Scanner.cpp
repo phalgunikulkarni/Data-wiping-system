@@ -145,6 +145,7 @@ public:
         if (!reader || identity.empty()) return error("A selected volume identity and reader are required");
         if (!reader->revalidate(identity, errorText)) return stale(errorText);
         if (lowerAscii(reader->volumeIdentity()) != lowerAscii(identity)) return stale("Selected volume identity changed");
+        identityValidated = true;
         if (lowerAscii(reader->fileSystem()) != "fat32") return unsupported("Selected volume is not FAT32");
         sectorSize = reader->logicalSectorSize();
         volumeSize = reader->sizeBytes();
@@ -176,16 +177,17 @@ public:
         FileScanResult result;
         result.status = FileScanStatus::Success;
         result.entries = std::move(entries);
+        result.volumeIdentityValidated = true;
         return result;
     }
 
 private:
     struct Dir { std::uint32_t startCluster; std::uint32_t cluster; QString path; std::uint32_t depth; bool pathKnown; };
 
-    FileScanResult error(const std::string& message) const { return {FileScanStatus::Error, {}, message}; }
-    FileScanResult unsupported(const std::string& message) const { return {FileScanStatus::Unsupported, {}, message}; }
+    FileScanResult error(const std::string& message) const { return {FileScanStatus::Error, {}, message, identityValidated, readError}; }
+    FileScanResult unsupported(const std::string& message) const { return {FileScanStatus::Unsupported, {}, message, identityValidated, readError}; }
     FileScanResult stale(const std::string& message) const { return {FileScanStatus::StaleVolume, {}, message.empty() ? "Selected volume identity is stale" : message}; }
-    FileScanResult cancelledResult() const { return {FileScanStatus::Cancelled, {}, "FAT32 identification was cancelled"}; }
+    FileScanResult cancelledResult() const { return {FileScanStatus::Cancelled, {}, "FAT32 identification was cancelled", identityValidated, readError}; }
     bool isCancelled() const { return cancelled && cancelled(); }
 
     bool parseGeometry(const std::vector<std::uint8_t>& boot)
@@ -214,7 +216,9 @@ private:
             !checkedMul(reserved, bps, fatOffset) || !checkedMul(fatSize, bps, fatBytes) ||
             !checkedMul(fats, fatSize, fatSectors) || !checkedAdd(reserved, fatSectors, firstDataSector) ||
             firstDataSector >= total || !checkedMul(firstDataSector, bps, dataOffset)) {
-            errorText = "FAT32 geometry overflows or exceeds the selected volume";
+            errorText = "FAT32 geometry arithmetic overflowed or BPB volume length (" +
+                std::to_string(totalBytes) + " bytes) exceeds the mounted-volume reader length (" +
+                std::to_string(volumeSize) + " bytes)";
             return false;
         }
         const std::uint64_t dataClusters = (total - firstDataSector) / spc;
@@ -250,8 +254,10 @@ private:
             if (!reader->revalidate(identity, identityError)) {
                 staleVolume = true;
                 errorText = identityError;
-            } else if (errorText.empty()) {
-                errorText = "Volume reader returned a short read";
+            } else {
+                readError = true;
+                if (errorText.empty())
+                    errorText = "Volume reader returned a short read";
             }
             return false;
         }
@@ -431,13 +437,13 @@ private:
             entry.fullPath = utf8(dir.path.isEmpty() ? name : dir.path + QLatin1Char('\\') + name);
         entry.sizeBytes = size;
         entry.sizeKnown = true;
-        entry.confidence = deleted ? (lfnIsStructurallyValid ? FileRecordConfidence::Candidate : FileRecordConfidence::Ambiguous)
+        entry.confidence = deleted ? FileRecordConfidence::Candidate
                                    : (nameKnown ? FileRecordConfidence::Validated : FileRecordConfidence::Ambiguous);
         entry.operationEligible = false;
         if (deleted) {
             entry.reason = lfnIsStructurallyValid
-                ? "Deleted LFN sequence is only a candidate: its checksum cannot be matched after deletion. Recoverability is unknown; operations are disabled."
-                : "Deleted short-name metadata is incomplete or ambiguous. Recoverability is unknown; operations are disabled.";
+                ? "A deleted directory-entry marker was identified. Its filename metadata is only a candidate, and content recoverability is unknown; operations are disabled."
+                : "A deleted directory-entry marker and its volume-relative slot were identified. The filename may be unavailable and content recoverability is unknown; operations are disabled.";
             if (directory) entry.reason += " Deleted directories are not traversed.";
             entry.sizeKnown = size <= geometry.volumeBytes && (size == 0 || (startCluster >= 2 && startCluster <= geometry.maximumCluster));
             if (size > 0 && (startCluster < 2 || startCluster > geometry.maximumCluster)) {
@@ -532,6 +538,8 @@ private:
     std::uint32_t sectorSize = 0, directoryCount = 0;
     std::uint64_t volumeSize = 0, readBytes = 0;
     bool staleVolume = false;
+    bool identityValidated = false;
+    bool readError = false;
     std::vector<FileEntry> entries;
     std::vector<LfnPart> lfnParts;
     std::deque<Dir> queue;
@@ -543,12 +551,24 @@ class WindowsMountedVolumeReader final : public IReadOnlyVolumeReader {
 public:
     explicit WindowsMountedVolumeReader(const DriveInfo& device)
         : root(std::wstring(1, static_cast<wchar_t>(device.letter)) + L":\\"),
-          identity(device.volumeGuid), fs(device.fileSystem), bytes(device.capacityBytes), sector(device.logicalSectorSize),
+          identity(device.volumeGuid), fs(device.fileSystem), bytes(0), sector(device.logicalSectorSize),
           handle(CreateFileW((std::wstring(L"\\\\.\\") + std::wstring(1, static_cast<wchar_t>(device.letter)) + L":").c_str(),
                              GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                             FILE_ATTRIBUTE_NORMAL, nullptr)) {}
+                             FILE_ATTRIBUTE_NORMAL, nullptr))
+    {
+        if (handle == INVALID_HANDLE_VALUE) return;
+        // Display capacity comes from GetDiskFreeSpaceEx. Parser bounds must
+        // instead use the addressable length of this exact mounted-volume
+        // handle, queried without translating to physical-disk offsets.
+        GET_LENGTH_INFORMATION length{};
+        DWORD returned = 0;
+        if (DeviceIoControl(handle, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0,
+                            &length, sizeof(length), &returned, nullptr) &&
+            returned >= sizeof(length) && length.Length.QuadPart > 0)
+            bytes = static_cast<std::uint64_t>(length.Length.QuadPart);
+    }
     ~WindowsMountedVolumeReader() override { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
-    bool isOpen() const { return handle != INVALID_HANDLE_VALUE; }
+    bool isOpen() const { return handle != INVALID_HANDLE_VALUE && bytes != 0; }
     std::string volumeIdentity() const override { return identity; }
     std::string fileSystem() const override { return fs; }
     std::uint64_t sizeBytes() const override { return bytes; }
@@ -652,7 +672,7 @@ std::shared_ptr<IReadOnlyVolumeReader> FileScanner::openMountedVolumeReadOnly(
     }
     auto reader = std::make_shared<WindowsMountedVolumeReader>(device);
     if (!reader->isOpen() || !reader->revalidate(device.volumeGuid, error)) {
-        if (error.empty()) error = "Could not open the selected mounted volume read-only";
+        if (error.empty()) error = "Could not open the selected mounted volume read-only or query its accessible length";
         return {};
     }
     return reader;

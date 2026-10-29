@@ -18,6 +18,7 @@ add_executable(WipeEngine WIN32
     src/StorageSafety.cpp
     src/FileScanner.cpp
     src/Fat32Scanner.cpp
+    src/RecoverabilityAssessment.cpp
     src/Logger.cpp
     src/CertificateGenerator.cpp
     src/FeatureExtractor.cpp
@@ -49,6 +50,7 @@ if(BUILD_TESTING)
         src/MainWindow.cpp
         src/DeviceManager.cpp
         src/Fat32Scanner.cpp
+        src/RecoverabilityAssessment.cpp
         src/ImageBackgroundWidget.cpp
         resources.qrc
     )
@@ -78,4 +80,10 @@ if(BUILD_TESTING)
     )
     target_link_libraries(FileScannerSafetyTests PRIVATE Qt6::Core)
     add_test(NAME FileScannerSafetyTests COMMAND FileScannerSafetyTests)
+
+    add_executable(RecoverabilityAssessmentTests
+        tests/RecoverabilityAssessmentTests.cpp
+        src/RecoverabilityAssessment.cpp
+    )
+    add_test(NAME RecoverabilityAssessmentTests COMMAND RecoverabilityAssessmentTests)
 endif()

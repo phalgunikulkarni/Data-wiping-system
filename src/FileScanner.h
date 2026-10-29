@@ -9,7 +9,7 @@
 #include "DeviceManager.h"
 
 enum class FileStatus { EXISTING, DELETED, INVALID };
-enum class FileScanStatus { Success, Unsupported, Error, Cancelled, StaleVolume };
+enum class FileScanStatus { Success, Partial, Unsupported, Error, Cancelled, StaleVolume };
 enum class FileRecordConfidence { Validated, Candidate, Ambiguous, Invalid };
 
 struct FileEntry {
@@ -38,6 +38,8 @@ struct FileScanResult {
     FileScanStatus status = FileScanStatus::Error;
     std::vector<FileEntry> entries;
     std::string errorMessage;
+    bool volumeIdentityValidated = false;
+    bool readError = false;
 };
 
 class FileScanner {

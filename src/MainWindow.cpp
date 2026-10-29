@@ -2,30 +2,42 @@
 #include "ImageBackgroundWidget.h"
 
 #include <QFrame>
+#include <QComboBox>
+#include <QAbstractItemView>
+#include <QAbstractTableModel>
+#include <QHeaderView>
 #include <QHash>
 #include <QGraphicsOpacityEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPaintEvent>
+#include <QRectF>
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSortFilterProxyModel>
 #include <QStackedWidget>
 #include <QStringList>
 #include <QThread>
 #include <QToolButton>
+#include <QTableView>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <memory>
 #include <atomic>
+#include <algorithm>
 
 namespace {
 const QString cardStyle = QStringLiteral(
-    "QFrame#contentCard { background-color:rgba(5,18,43,226); border:1px solid rgba(122,177,211,75); border-radius:14px; }"
-    "QFrame#quickCard { background-color:rgba(5,18,43,226); border:1px solid rgba(122,177,211,75); border-radius:12px; }");
+    "QFrame#contentCard { background-color:rgba(7,10,20,238); border:1px solid rgba(109,145,181,72); border-radius:14px; }"
+    "QFrame#quickCard { background-color:rgba(7,10,20,238); border:1px solid rgba(109,145,181,72); border-radius:12px; }");
 
 QLabel* heading(const QString& text, QWidget* parent = nullptr)
 {
@@ -101,6 +113,155 @@ QString volumeIdentity(const DriveInfo& device)
 }
 }
 
+class DashboardFileFilterProxy final : public QSortFilterProxyModel {
+public:
+    explicit DashboardFileFilterProxy(QObject* parent = nullptr) : QSortFilterProxyModel(parent) {}
+    void setStatusFilter(int filter)
+    {
+        beginFilterChange();
+        m_statusFilter = filter;
+        endFilterChange(QSortFilterProxyModel::Direction::Rows);
+    }
+
+protected:
+    bool filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const override
+    {
+        if (!QSortFilterProxyModel::filterAcceptsRow(sourceRow, sourceParent)) return false;
+        if (m_statusFilter == 0) return true;
+        const QModelIndex status = sourceModel()->index(sourceRow, 3, sourceParent);
+        const int entryStatus = sourceModel()->data(status, Qt::UserRole + 1).toInt();
+        return entryStatus == m_statusFilter;
+    }
+
+private:
+    int m_statusFilter = 0; // 0 all, 1 existing, 2 deleted candidates
+};
+
+class DashboardFileTableModel final : public QAbstractTableModel {
+public:
+    explicit DashboardFileTableModel(QObject* parent = nullptr) : QAbstractTableModel(parent) {}
+    int rowCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : static_cast<int>(m_entries.size()); }
+    int columnCount(const QModelIndex& parent = {}) const override { return parent.isValid() ? 0 : 4; }
+    QVariant headerData(int section, Qt::Orientation orientation, int role) const override
+    {
+        if (orientation != Qt::Horizontal || role != Qt::DisplayRole) return {};
+        static const std::array<QString,4> headers = {QStringLiteral("File Name"),QStringLiteral("Path / Location"),QStringLiteral("Size"),QStringLiteral("Status")};
+        return section >= 0 && section < static_cast<int>(headers.size()) ? QVariant(headers[static_cast<std::size_t>(section)]) : QVariant();
+    }
+    QVariant data(const QModelIndex& index, int role) const override
+    {
+        if (!index.isValid() || index.row() < 0 || index.row() >= rowCount()) return {};
+        const FileEntry& entry = m_entries[static_cast<std::size_t>(index.row())];
+        const int statusCode = entry.status == FileStatus::EXISTING ? 1 : 2;
+        if (role == Qt::UserRole + 1 && index.column() == 3) return statusCode;
+        if (role != Qt::DisplayRole) return {};
+        const auto text = [](const std::string& value) { return QString::fromUtf8(value.data(),static_cast<qsizetype>(value.size())); };
+        switch (index.column()) {
+        case 0: return entry.nameKnown && !entry.name.empty() ? text(entry.name) : QStringLiteral("Unavailable");
+        case 1:
+            if (!entry.fullPath.empty()) return text(entry.fullPath);
+            return entry.parentPathKnown && !entry.parentPath.empty() ? text(entry.parentPath) : QStringLiteral("Unavailable");
+        case 2: return entry.sizeKnown ? QStringLiteral("%1 bytes").arg(entry.sizeBytes) : QStringLiteral("Unavailable");
+        case 3: return statusCode == 1 ? QStringLiteral("Existing") : QStringLiteral("Deleted candidate");
+        default: return {};
+        }
+    }
+    void setEntries(std::vector<FileEntry> entries)
+    {
+        beginResetModel();
+        m_entries = std::move(entries);
+        endResetModel();
+    }
+private:
+    std::vector<FileEntry> m_entries;
+};
+
+class EvidenceBreakdownWidget final : public QWidget {
+public:
+    explicit EvidenceBreakdownWidget(QWidget* parent = nullptr) : QWidget(parent)
+    {
+        setMinimumHeight(92);
+        setAttribute(Qt::WA_TranslucentBackground);
+    }
+
+    void setCounts(std::uint64_t existing, std::uint64_t deletedCandidates,
+                   std::uint64_t ambiguous, std::uint64_t invalid, bool available)
+    {
+        m_counts = {existing, deletedCandidates, ambiguous, invalid};
+        m_available = available;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QRectF bar(2, 4, std::max(0, width() - 4), 15);
+        painter.setPen(QPen(QColor(110, 145, 174, 70), 1));
+        painter.setBrush(QColor(2, 9, 22, 160));
+        painter.drawRoundedRect(bar, 7, 7);
+
+        const std::array<QColor, 4> colors = {
+            QColor(QStringLiteral("#2ca9c2")), QColor(QStringLiteral("#6bd8ee")),
+            QColor(QStringLiteral("#e56b9c")), QColor(QStringLiteral("#f09b72"))};
+        const std::array<QString, 4> labels = {
+            QStringLiteral("Existing"), QStringLiteral("Deleted candidates"),
+            QStringLiteral("Ambiguous"), QStringLiteral("Invalid")};
+        if (!m_available) {
+            painter.setPen(QColor(QStringLiteral("#9eafc1")));
+            painter.drawText(QRectF(2, 28, width() - 4, 22), Qt::AlignLeft | Qt::AlignVCenter,
+                             QStringLiteral("Distribution unavailable for this scan"));
+            return;
+        }
+
+        long double total = 0;
+        for (const auto count : m_counts) total += static_cast<long double>(count);
+        if (total == 0) {
+            painter.setPen(QColor(QStringLiteral("#9eafc1")));
+            painter.drawText(QRectF(2, 28, width() - 4, 22), Qt::AlignLeft | Qt::AlignVCenter,
+                             QStringLiteral("No directory records were returned"));
+        } else {
+            QPainterPath clip;
+            clip.addRoundedRect(bar, 7, 7);
+            painter.save();
+            painter.setClipPath(clip);
+            qreal x = bar.left();
+            int lastNonzero = -1;
+            for (int i = 0; i < 4; ++i) if (m_counts[static_cast<std::size_t>(i)] != 0) lastNonzero = i;
+            for (int i = 0; i < 4; ++i) {
+                const auto count = m_counts[static_cast<std::size_t>(i)];
+                if (!count) continue;
+                const qreal segmentWidth = i == lastNonzero
+                    ? bar.right() - x
+                    : bar.width() * static_cast<qreal>(static_cast<long double>(count) / total);
+                painter.fillRect(QRectF(x, bar.top(), segmentWidth, bar.height()), colors[static_cast<std::size_t>(i)]);
+                x += segmentWidth;
+            }
+            painter.restore();
+        }
+
+        const qreal columnWidth = width() / 2.0;
+        for (int i = 0; i < 4; ++i) {
+            const int row = i / 2;
+            const int column = i % 2;
+            const qreal x = 2 + column * columnWidth;
+            const qreal y = 31 + row * 25;
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(colors[static_cast<std::size_t>(i)]);
+            painter.drawRoundedRect(QRectF(x, y + 4, 9, 9), 3, 3);
+            painter.setPen(QColor(QStringLiteral("#b9c8d8")));
+            const QString count = m_available ? QString::number(m_counts[static_cast<std::size_t>(i)]) : QStringLiteral("—");
+            painter.drawText(QRectF(x + 15, y, columnWidth - 18, 18), Qt::AlignLeft | Qt::AlignVCenter,
+                             QStringLiteral("%1  %2").arg(labels[static_cast<std::size_t>(i)], count));
+        }
+    }
+
+private:
+    std::array<std::uint64_t, 4> m_counts{};
+    bool m_available = false;
+};
+
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
     setWindowTitle(QStringLiteral("DataGuard — Secure. Recover. Verify."));
@@ -115,7 +276,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     auto* sidebar = new QFrame(background);
     sidebar->setObjectName(QStringLiteral("sidebar"));
     sidebar->setFixedWidth(218);
-    sidebar->setStyleSheet(QStringLiteral("QFrame#sidebar { background-color:rgba(4,15,38,232); border:1px solid rgba(122,177,211,65); border-radius:16px; }"));
+    sidebar->setStyleSheet(QStringLiteral("QFrame#sidebar { background-color:rgba(7,9,18,244); border:1px solid rgba(109,145,181,60); border-radius:16px; }"));
     auto* sideLayout = new QVBoxLayout(sidebar);
     sideLayout->setContentsMargins(14,18,14,16);
     sideLayout->setSpacing(8);
@@ -157,7 +318,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
     auto* header = new QFrame(right);
     header->setObjectName(QStringLiteral("header"));
-    header->setStyleSheet(QStringLiteral("QFrame#header { background-color:rgba(4,15,38,224); border:1px solid rgba(122,177,211,65); border-radius:14px; }"));
+    header->setStyleSheet(QStringLiteral("QFrame#header { background-color:rgba(7,9,18,240); border:1px solid rgba(109,145,181,60); border-radius:14px; }"));
     auto* headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(20,10,16,10);
     m_pageTitle = new QLabel(QStringLiteral("Dashboard"), header);
@@ -318,6 +479,19 @@ QWidget* MainWindow::buildDashboardPage()
     m_scanDetailLabel = bodyText(QStringLiteral("Connected removable storage volumes are being checked. This read-only check does not modify their contents."),scanningCard);
     m_scanDetailLabel->setAlignment(Qt::AlignCenter);
     scanningBox->addWidget(m_scanDetailLabel);
+    m_progressStatusLabel = m_scanStatusLabel;
+    m_progressDetailLabel = m_scanDetailLabel;
+    m_assessmentCancelButton = new QPushButton(QStringLiteral("Cancel Assessment"),scanningCard);
+    m_assessmentCancelButton->setEnabled(false);
+    m_assessmentCancelButton->hide();
+    connect(m_assessmentCancelButton,&QPushButton::clicked,this,[this]() {
+        if (m_assessmentInProgress && m_fileScanCancelled) {
+            m_fileScanCancelled->store(true);
+            m_progressStatusLabel->setText(QStringLiteral("Cancelling assessment…"));
+            m_assessmentCancelButton->setEnabled(false);
+        }
+    });
+    scanningBox->addWidget(m_assessmentCancelButton,0,Qt::AlignHCenter);
     scanningLayout->addWidget(scanningCard,0,Qt::AlignHCenter);
     scanningLayout->addStretch(1);
     m_dashboardStates->addWidget(scanningPage);
@@ -390,15 +564,11 @@ QWidget* MainWindow::buildDashboardPage()
     nextStepTitle->setStyleSheet(QStringLiteral("color:#75d9f5; font-size:13px; font-weight:700;"));
     selectedLayout->addWidget(nextStepTitle);
     selectedLayout->addWidget(bodyText(QStringLiteral("FAT32 deleted-entry identification is read-only. It does not establish recoverability or enable storage operations."),m_selectedDevicePanel));
-    auto* identifyEntries = new QPushButton(QStringLiteral("Identify FAT32 Entries"),m_selectedDevicePanel);
-    identifyEntries->setMinimumHeight(38);
-    identifyEntries->setStyleSheet(QStringLiteral("QPushButton { color:white; background:#1677c8; border:0; border-radius:8px; padding:8px 12px; font-weight:700; } QPushButton:hover { background:#2395dc; }"));
-    selectedLayout->addWidget(identifyEntries);
-    connect(identifyEntries,&QPushButton::clicked,this,[this]() {
-        m_navigationButtons[2]->setChecked(true);
-        navigateTo(2,QStringLiteral("Scan Results"));
-        startDeletedEntryScan();
-    });
+    m_nextStepButton = new QPushButton(QStringLiteral("Next Step"),m_selectedDevicePanel);
+    m_nextStepButton->setMinimumHeight(38);
+    m_nextStepButton->setStyleSheet(QStringLiteral("QPushButton { color:white; background:#1677c8; border:0; border-radius:8px; padding:8px 12px; font-weight:700; } QPushButton:hover { background:#2395dc; } QPushButton:disabled { background:#465b70; color:#aab8c5; }"));
+    selectedLayout->addWidget(m_nextStepButton);
+    connect(m_nextStepButton,&QPushButton::clicked,this,&MainWindow::startDriveAssessment);
     m_selectedDevicePanel->hide();
     selectionLayout->addWidget(m_selectedDevicePanel,1);
     selectionLayout->addStretch();
@@ -447,10 +617,208 @@ QWidget* MainWindow::buildDashboardPage()
     makeRetryPage(QStringLiteral("⌕"),QStringLiteral("No devices found"),QStringLiteral("Connect a supported USB or storage device and try again."),3);
     makeRetryPage(QStringLiteral("!"),QStringLiteral("Device check failed"),QStringLiteral("The system could not enumerate mounted drives. Try again."),4);
 
+    m_dashboardStates->addWidget(buildDashboardAssessmentPage());
+
     layout->addWidget(m_dashboardStates,1);
     m_dashboardStates->setCurrentIndex(0);
     return page;
 }
+QWidget* MainWindow::buildDashboardAssessmentPage()
+{
+    auto* content = new QWidget;
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(4,6,8,10);
+    layout->setSpacing(9);
+
+    auto* overview = makeCard(content);
+    overview->setObjectName(QStringLiteral("assessmentDriveOverview"));
+    auto* overviewLayout = new QVBoxLayout(overview);
+    overviewLayout->setContentsMargins(16,12,16,14);
+    overviewLayout->setSpacing(9);
+    auto* overviewHeader = new QHBoxLayout;
+    auto* overviewTitle = heading(QStringLiteral("Drive Overview"),overview);
+    overviewTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:16px; font-weight:700;"));
+    overviewHeader->addWidget(overviewTitle);
+    overviewHeader->addStretch();
+    auto* overviewNote = bodyText(QStringLiteral("Selected volume snapshot"),overview);
+    overviewNote->setStyleSheet(QStringLiteral("color:#83a0ba; font-size:11px;"));
+    overviewHeader->addWidget(overviewNote);
+    overviewLayout->addLayout(overviewHeader);
+    auto* overviewGrid = new QGridLayout;
+    overviewGrid->setHorizontalSpacing(8);
+    overviewGrid->setVerticalSpacing(7);
+    const QStringList overviewCaptions = {
+        QStringLiteral("VOLUME LABEL"),QStringLiteral("MOUNT POINT"),QStringLiteral("FILESYSTEM"),QStringLiteral("VOLUME CAPACITY"),
+        QStringLiteral("USED SPACE"),QStringLiteral("TOTAL FREE"),QStringLiteral("VOLUME IDENTITY"),QStringLiteral("PHYSICAL DISK / PARTITION")};
+    for (int i = 0; i < static_cast<int>(m_driveOverviewValues.size()); ++i) {
+        auto* tile = new QFrame(overview);
+        tile->setStyleSheet(QStringLiteral("QFrame { background:rgba(16,23,37,205); border:1px solid rgba(94,128,160,48); border-radius:9px; }"));
+        auto* tileLayout = new QVBoxLayout(tile);
+        tileLayout->setContentsMargins(10,7,10,7);
+        tileLayout->setSpacing(3);
+        auto* caption = new QLabel(overviewCaptions[i],tile);
+        caption->setStyleSheet(QStringLiteral("color:#8097b0; font-size:9px; font-weight:700; letter-spacing:1px; background:transparent; border:0;"));
+        tileLayout->addWidget(caption);
+        m_driveOverviewValues[static_cast<std::size_t>(i)] = new QLabel(QStringLiteral("—"),tile);
+        m_driveOverviewValues[static_cast<std::size_t>(i)]->setWordWrap(true);
+        m_driveOverviewValues[static_cast<std::size_t>(i)]->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        m_driveOverviewValues[static_cast<std::size_t>(i)]->setStyleSheet(QStringLiteral("color:#eaf3fb; font-size:12px; font-weight:600; background:transparent; border:0;"));
+        tileLayout->addWidget(m_driveOverviewValues[static_cast<std::size_t>(i)]);
+        overviewGrid->addWidget(tile,i/4,i%4);
+    }
+    overviewLayout->addLayout(overviewGrid);
+    layout->addWidget(overview);
+
+    auto* summary = makeCard(content);
+    summary->setObjectName(QStringLiteral("assessmentScanSummary"));
+    auto* summaryLayout = new QVBoxLayout(summary);
+    summaryLayout->setContentsMargins(16,11,16,12);
+    summaryLayout->setSpacing(8);
+    auto* summaryHeader = new QHBoxLayout;
+    auto* summaryTitle = heading(QStringLiteral("Scan Summary"),summary);
+    summaryTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:16px; font-weight:700;"));
+    summaryHeader->addWidget(summaryTitle);
+    summaryHeader->addStretch();
+    m_assessmentCompletionBadge = new QLabel(QStringLiteral("NOT SCANNED"),summary);
+    m_assessmentCompletionBadge->setAlignment(Qt::AlignCenter);
+    m_assessmentCompletionBadge->setStyleSheet(QStringLiteral("color:#9db1c5; background:rgba(59,75,95,100); border:1px solid rgba(125,153,180,65); border-radius:9px; padding:4px 9px; font-size:9px; font-weight:700; letter-spacing:1px;"));
+    summaryHeader->addWidget(m_assessmentCompletionBadge);
+    summaryLayout->addLayout(summaryHeader);
+    auto* metrics = new QGridLayout;
+    metrics->setSpacing(8);
+    const QStringList metricCaptions = {QStringLiteral("EXISTING FILES"),QStringLiteral("DELETED ENTRIES")};
+    const std::array<QString,2> metricColors = {QStringLiteral("#59cde2"),QStringLiteral("#83ddeb")};
+    for (int i = 0; i < static_cast<int>(m_assessmentMetricValues.size()); ++i) {
+        auto* tile = new QFrame(summary);
+        tile->setStyleSheet(QStringLiteral("QFrame { background:rgba(16,23,37,205); border:1px solid rgba(94,128,160,48); border-radius:10px; }"));
+        auto* tileLayout = new QVBoxLayout(tile);
+        tileLayout->setContentsMargins(11,7,11,7);
+        tileLayout->setSpacing(1);
+        auto* caption = new QLabel(metricCaptions[i],tile);
+        caption->setStyleSheet(QStringLiteral("color:#8198b1; font-size:9px; font-weight:700; letter-spacing:1px; background:transparent; border:0;"));
+        tileLayout->addWidget(caption);
+        m_assessmentMetricValues[static_cast<std::size_t>(i)] = new QLabel(QStringLiteral("—"),tile);
+        m_assessmentMetricValues[static_cast<std::size_t>(i)]->setStyleSheet(QStringLiteral("color:%1; font-size:22px; font-weight:700; background:transparent; border:0;" ).arg(metricColors[static_cast<std::size_t>(i)]));
+        tileLayout->addWidget(m_assessmentMetricValues[static_cast<std::size_t>(i)]);
+        metrics->addWidget(tile,0,i);
+    }
+    summaryLayout->addLayout(metrics);
+    layout->addWidget(summary);
+
+    auto* files = makeCard(content);
+    files->setObjectName(QStringLiteral("dashboardFilesOnDrive"));
+    auto* filesLayout = new QVBoxLayout(files);
+    filesLayout->setContentsMargins(16,11,16,12);
+    filesLayout->setSpacing(8);
+    auto* filesHeader = new QHBoxLayout;
+    auto* filesTitle = heading(QStringLiteral("Files on Selected Drive"),files);
+    filesTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:16px; font-weight:700;"));
+    filesHeader->addWidget(filesTitle);
+    filesHeader->addStretch();
+    m_fileSearch = new QLineEdit(files);
+    m_fileSearch->setObjectName(QStringLiteral("dashboardFileSearch"));
+    m_fileSearch->setPlaceholderText(QStringLiteral("Search by file name or path"));
+    m_fileSearch->setClearButtonEnabled(true);
+    m_fileSearch->setMinimumWidth(220);
+    m_fileSearch->setStyleSheet(QStringLiteral("QLineEdit { color:#eaf3fb; background:rgba(9,16,28,230); border:1px solid rgba(105,145,177,80); border-radius:7px; padding:7px 9px; } QLineEdit:focus { border-color:#55cde5; }"));
+    filesHeader->addWidget(m_fileSearch);
+    m_fileFilter = new QComboBox(files);
+    m_fileFilter->setObjectName(QStringLiteral("dashboardFileFilter"));
+    m_fileFilter->addItems({QStringLiteral("All Files"),QStringLiteral("Existing"),QStringLiteral("Deleted")});
+    m_fileFilter->setStyleSheet(QStringLiteral("QComboBox { color:#dce9f5; background:rgba(9,16,28,230); border:1px solid rgba(105,145,177,80); border-radius:7px; padding:6px 9px; min-width:90px; } QComboBox QAbstractItemView { color:#dce9f5; background:#101827; selection-background-color:#17495b; }"));
+    filesHeader->addWidget(m_fileFilter);
+    filesLayout->addLayout(filesHeader);
+    m_dashboardFileStatus = bodyText(QStringLiteral("Run a supported FAT32 scan to list file records."),files);
+    m_dashboardFileStatus->setObjectName(QStringLiteral("dashboardFileStatus"));
+    m_dashboardFileStatus->setStyleSheet(QStringLiteral("color:#91a8bf; font-size:11px;"));
+    filesLayout->addWidget(m_dashboardFileStatus);
+    m_assessmentSummary = m_dashboardFileStatus;
+    m_dashboardFileTable = new QTableView(files);
+    m_dashboardFileTable->setObjectName(QStringLiteral("dashboardFileTable"));
+    m_dashboardFileModel = new DashboardFileTableModel(m_dashboardFileTable);
+    m_dashboardFileProxy = new DashboardFileFilterProxy(m_dashboardFileTable);
+    m_dashboardFileProxy->setSourceModel(m_dashboardFileModel);
+    m_dashboardFileProxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
+    m_dashboardFileProxy->setFilterKeyColumn(-1);
+    m_dashboardFileTable->setModel(m_dashboardFileProxy);
+    m_dashboardFileTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_dashboardFileTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_dashboardFileTable->setAlternatingRowColors(true);
+    m_dashboardFileTable->setShowGrid(false);
+    m_dashboardFileTable->verticalHeader()->hide();
+    m_dashboardFileTable->horizontalHeader()->setStretchLastSection(true);
+    m_dashboardFileTable->horizontalHeader()->setSectionResizeMode(0,QHeaderView::ResizeToContents);
+    m_dashboardFileTable->horizontalHeader()->setSectionResizeMode(1,QHeaderView::Stretch);
+    m_dashboardFileTable->horizontalHeader()->setSectionResizeMode(2,QHeaderView::ResizeToContents);
+    m_dashboardFileTable->horizontalHeader()->setSectionResizeMode(3,QHeaderView::ResizeToContents);
+    m_dashboardFileTable->setMinimumHeight(168);
+    m_dashboardFileTable->setMaximumHeight(330);
+    m_dashboardFileTable->setStyleSheet(QStringLiteral("QTableView { color:#dce9f5; background:rgba(8,14,25,210); alternate-background-color:rgba(20,30,45,210); border:1px solid rgba(105,145,177,55); border-radius:8px; selection-background-color:rgba(41,119,143,150); } QHeaderView::section { color:#91a8bf; background:rgba(19,28,42,240); border:0; border-bottom:1px solid rgba(105,145,177,65); padding:7px; font-size:10px; font-weight:700; }"));
+    filesLayout->addWidget(m_dashboardFileTable);
+    connect(m_fileSearch,&QLineEdit::textChanged,m_dashboardFileProxy,&QSortFilterProxyModel::setFilterFixedString);
+    connect(m_fileFilter,qOverload<int>(&QComboBox::currentIndexChanged),m_dashboardFileProxy,&DashboardFileFilterProxy::setStatusFilter);
+    layout->addWidget(files);
+
+    auto* panels = new QHBoxLayout;
+    panels->setSpacing(9);
+    auto* indicators = makeCard(content);
+    indicators->setObjectName(QStringLiteral("recoverabilityIndicators"));
+    auto* indicatorsLayout = new QVBoxLayout(indicators);
+    indicatorsLayout->setContentsMargins(15,12,15,12);
+    indicatorsLayout->setSpacing(7);
+    auto* indicatorsTitle = heading(QStringLiteral("Recoverability Indicators"),indicators);
+    indicatorsTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:15px; font-weight:700;"));
+    indicatorsLayout->addWidget(indicatorsTitle);
+    auto* chartLabel = bodyText(QStringLiteral("Directory record distribution"),indicators);
+    chartLabel->setStyleSheet(QStringLiteral("color:#88a1ba; font-size:11px;"));
+    indicatorsLayout->addWidget(chartLabel);
+    m_evidenceBreakdown = new EvidenceBreakdownWidget(indicators);
+    m_evidenceBreakdown->setObjectName(QStringLiteral("evidenceBreakdownChart"));
+    indicatorsLayout->addWidget(m_evidenceBreakdown);
+    m_assessmentIndicators = bodyText(QStringLiteral("The selected drive has not been assessed."),indicators);
+    m_assessmentIndicators->setStyleSheet(QStringLiteral("color:#9eafc2; font-size:11px;"));
+    indicatorsLayout->addWidget(m_assessmentIndicators,1);
+    panels->addWidget(indicators,1);
+
+    auto* result = makeCard(content);
+    result->setObjectName(QStringLiteral("assessmentResult"));
+    auto* resultLayout = new QVBoxLayout(result);
+    resultLayout->setContentsMargins(15,12,15,12);
+    resultLayout->setSpacing(8);
+    auto* resultTitle = heading(QStringLiteral("Assessment Result"),result);
+    resultTitle->setStyleSheet(QStringLiteral("color:#eff7ff; font-size:15px; font-weight:700;"));
+    resultLayout->addWidget(resultTitle);
+    m_assessmentStatus = new QLabel(QStringLiteral("Assessment Incomplete"),result);
+    m_assessmentStatus->setWordWrap(true);
+    m_assessmentStatus->setStyleSheet(QStringLiteral("color:#73dcf5; background:rgba(31,66,85,100); border:1px solid rgba(91,188,211,70); border-radius:9px; padding:7px 10px; font-size:14px; font-weight:700;"));
+    resultLayout->addWidget(m_assessmentStatus);
+    m_assessmentExplanation = bodyText(QString(),result);
+    resultLayout->addWidget(m_assessmentExplanation);
+    m_assessmentNextSteps = bodyText(QString(),result);
+    m_assessmentNextSteps->setStyleSheet(QStringLiteral("color:#d7e6f3; font-size:12px;"));
+    resultLayout->addWidget(m_assessmentNextSteps);
+    auto* modelNote = bodyText(QStringLiteral("DETERMINISTIC ASSESSMENT · No validated pre-wipe model is available."),result);
+    modelNote->setStyleSheet(QStringLiteral("color:#8198b1; font-size:9px; font-weight:700; letter-spacing:0.5px;"));
+    resultLayout->addWidget(modelNote);
+    auto* actions = new QHBoxLayout;
+    m_assessmentRetryButton = new QPushButton(QStringLiteral("Retry Assessment"),result);
+    m_assessmentRetryButton->setMinimumHeight(36);
+    m_assessmentRetryButton->setStyleSheet(QStringLiteral("QPushButton { color:#07111d; background:#59cde2; border:0; border-radius:8px; padding:7px 11px; font-weight:700; } QPushButton:hover { background:#8be5f2; } QPushButton:disabled { background:#506373; color:#aab8c5; }"));
+    connect(m_assessmentRetryButton,&QPushButton::clicked,this,&MainWindow::startDriveAssessment);
+    actions->addWidget(m_assessmentRetryButton);
+    m_assessmentBackButton = new QPushButton(QStringLiteral("Back to Drive Selection"),result);
+    m_assessmentBackButton->setMinimumHeight(36);
+    m_assessmentBackButton->setStyleSheet(QStringLiteral("QPushButton { color:#c5d3e1; background:rgba(24,33,48,220); border:1px solid rgba(116,148,178,80); border-radius:8px; padding:7px 11px; font-weight:600; } QPushButton:hover { background:rgba(42,57,76,230); }"));
+    connect(m_assessmentBackButton,&QPushButton::clicked,this,[this]() {
+        m_dashboardStates->setCurrentIndex(2);
+    });
+    actions->addWidget(m_assessmentBackButton);
+    resultLayout->addLayout(actions);
+    panels->addWidget(result,1);
+    layout->addLayout(panels,1);
+    return scrollPage(content);
+}
+
 QWidget* MainWindow::buildDevicesPage()
 {
     auto* page = new QWidget;
@@ -536,7 +904,7 @@ QWidget* MainWindow::buildScanResultsPage()
 
 void MainWindow::startDeletedEntryScan()
 {
-    if (m_fileScanInProgress)
+    if (m_fileScanInProgress || m_deviceScanInProgress)
         return;
     if (!m_hasSelectedDrive || m_selectedDeviceIdentity.isEmpty() ||
         volumeIdentity(m_selectedDriveInfo) != m_selectedDeviceIdentity) {
@@ -557,28 +925,9 @@ void MainWindow::startDeletedEntryScan()
     m_fileScanStatus->setText(QStringLiteral("Reading FAT32 directory metadata…"));
 
     const DriveInfo selected = m_selectedDriveInfo;
-    const std::string expected = m_selectedDeviceIdentity.toStdString();
-    auto cancelled = m_fileScanCancelled;
-    auto result = std::make_shared<FileScanResult>();
-    auto openError = std::make_shared<std::string>();
-    QThread* worker = QThread::create([selected, expected, cancelled, result, openError]() {
-        auto reader = FileScanner::openMountedVolumeReadOnly(selected, *openError);
-        if (!reader) {
-            result->status = FileScanStatus::Error;
-            result->errorMessage = *openError;
-            return;
-        }
-        *result = FileScanner::scanFat32(reader, expected, FileScanner::Limits{},
-                                         [cancelled]() { return cancelled->load(); });
+    launchFat32Scan(selected,[this,sourceLabel](const FileScanResult& result) {
+        completeDeletedEntryScan(result,sourceLabel);
     });
-    m_fileScanThread = worker;
-    connect(worker,&QThread::finished,this,[this,worker,result,sourceLabel]() {
-        if (m_fileScanThread == worker)
-            m_fileScanThread = nullptr;
-        worker->deleteLater();
-        completeDeletedEntryScan(*result,sourceLabel);
-    });
-    worker->start();
 }
 
 void MainWindow::completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume)
@@ -627,9 +976,235 @@ void MainWindow::completeDeletedEntryScan(const FileScanResult& result, const QS
     m_fileScanCancelled.reset();
 }
 
+void MainWindow::startDriveAssessment()
+{
+    if (m_assessmentInProgress || m_fileScanInProgress || m_deviceScanInProgress)
+        return;
+    if (!m_hasSelectedDrive || m_selectedDeviceIdentity.isEmpty() ||
+        volumeIdentity(m_selectedDriveInfo) != m_selectedDeviceIdentity) {
+        m_assessmentStatus->setText(QStringLiteral("Assessment Incomplete"));
+        m_assessmentExplanation->setText(QStringLiteral("The selected volume identity is unavailable or stale. Return to device selection and rescan."));
+        m_dashboardStates->setCurrentIndex(5);
+        return;
+    }
+
+    m_assessmentInProgress = true;
+    m_fileScanInProgress = true;
+    m_fileScanCancelled = std::make_shared<std::atomic_bool>(false);
+    m_nextStepButton->setEnabled(false);
+    m_scanButton->setEnabled(false);
+    m_assessmentCancelButton->show();
+    m_assessmentCancelButton->setEnabled(true);
+    m_dashboardFileModel->setEntries({});
+    m_fileSearch->clear();
+    m_fileFilter->setCurrentIndex(0);
+    m_dashboardFileStatus->setText(QStringLiteral("Scanning FAT32 directory records… results will appear here when validation completes."));
+    for (QLabel* metric : m_assessmentMetricValues) metric->setText(QStringLiteral("…"));
+    m_progressStatusLabel->setText(QStringLiteral("Assessing selected drive…"));
+    m_progressDetailLabel->setText(QStringLiteral("Reading FAT32 directory metadata. Progress is indeterminate; no drive contents are modified."));
+    m_dashboardStates->setCurrentIndex(1);
+    m_scanAnimation->start();
+
+    const DriveInfo drive = m_selectedDriveInfo;
+    launchFat32Scan(drive,[this,drive](const FileScanResult& result) {
+        completeDriveAssessment(result,drive);
+    });
+}
+
+void MainWindow::launchFat32Scan(const DriveInfo& drive, std::function<void(const FileScanResult&)> completion)
+{
+    if (m_fileScanThread || !m_fileScanCancelled)
+        return;
+    const std::string expectedIdentity = m_selectedDeviceIdentity.toStdString();
+    const auto cancelled = m_fileScanCancelled;
+    auto result = std::make_shared<FileScanResult>();
+    auto openError = std::make_shared<std::string>();
+    QThread* worker = QThread::create([drive,expectedIdentity,cancelled,result,openError]() {
+        auto reader = FileScanner::openMountedVolumeReadOnly(drive,*openError);
+        if (!reader) {
+            result->status = FileScanStatus::Error;
+            result->errorMessage = *openError;
+            return;
+        }
+        *result = FileScanner::scanFat32(reader,expectedIdentity,FileScanner::Limits{},
+                                         [cancelled]() { return cancelled->load(); });
+    });
+    m_fileScanThread = worker;
+    connect(worker,&QThread::finished,this,[this,worker,result,completion=std::move(completion)]() {
+        if (m_fileScanThread == worker)
+            m_fileScanThread = nullptr;
+        worker->deleteLater();
+        completion(*result);
+    });
+    worker->start();
+}
+
+void MainWindow::completeDriveAssessment(const FileScanResult& result, const DriveInfo& drive)
+{
+    m_assessmentInProgress = false;
+    m_fileScanInProgress = false;
+    m_assessmentCancelButton->hide();
+    m_assessmentCancelButton->setEnabled(false);
+    m_scanButton->setEnabled(true);
+    m_nextStepButton->setEnabled(true);
+    stopScanAnimation();
+
+    const bool currentVolume = m_hasSelectedDrive &&
+        volumeIdentity(drive) == m_selectedDeviceIdentity &&
+        volumeIdentity(m_selectedDriveInfo) == m_selectedDeviceIdentity;
+    m_dashboardFileModel->setEntries({});
+    m_dashboardFileProxy->setFilterFixedString(QString());
+    if (m_fileSearch) m_fileSearch->clear();
+    if (m_fileFilter) m_fileFilter->setCurrentIndex(0);
+    if (!currentVolume) {
+        m_dashboardFileStatus->setText(QStringLiteral("Results discarded: the selected volume changed or became stale during the scan."));
+        for (QLabel* metric : m_assessmentMetricValues) metric->setText(QStringLiteral("Unavailable"));
+        m_assessmentStatus->setText(QStringLiteral("Assessment Incomplete"));
+        m_assessmentExplanation->setText(QStringLiteral("The scan result no longer matches the selected volume identity. Rescan the device before continuing."));
+        m_assessmentNextSteps->clear();
+        m_evidenceBreakdown->setCounts(0,0,0,0,false);
+        m_dashboardStates->setCurrentIndex(5);
+        m_fileScanCancelled.reset();
+        return;
+    }
+
+    const bool supported = QString::fromStdString(drive.fileSystem).compare(QStringLiteral("FAT32"),Qt::CaseInsensitive)==0;
+    const QString volumeLabel = drive.volumeLabel.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.volumeLabel);
+    const QString mount = drive.mountPoint.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.mountPoint);
+    const QString identity = drive.volumeGuid.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.volumeGuid);
+    const QString filesystem = drive.fileSystem.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.fileSystem);
+    QString used = QStringLiteral("Unknown");
+    QString free = drive.totalFreeBytesAvailable ? QStringLiteral("%1 bytes").arg(drive.totalFreeBytes) : QStringLiteral("Unknown");
+    if (drive.capacityAvailable && drive.totalFreeBytesAvailable && drive.totalFreeBytes <= drive.capacityBytes)
+        used = QStringLiteral("%1 bytes").arg(drive.capacityBytes-drive.totalFreeBytes);
+    const QString physical = drive.physicalDiskNumber.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.physicalDiskNumber);
+    const QString physicalModel = drive.deviceModel.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.deviceModel);
+    const QString busType = drive.busType.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.busType);
+    const QString deviceType = drive.deviceType.empty() ? QStringLiteral("Unknown") : QString::fromStdString(drive.deviceType);
+    const QString availableToCaller = drive.availableBytesAvailable ? QStringLiteral("%1 bytes").arg(drive.availableBytes) : QStringLiteral("Unknown");
+    const QString partition = drive.partitionInfoAvailable
+        ? QStringLiteral("Partition %1 · offset %2 bytes · length %3 bytes")
+              .arg(QString::fromStdString(drive.partitionNumber)).arg(drive.partitionOffsetBytes).arg(drive.partitionLengthBytes)
+        : QStringLiteral("Unknown");
+    QString physicalDetails = physical;
+    if (physicalModel != QStringLiteral("Unknown")) physicalDetails += QStringLiteral(" · %1").arg(physicalModel);
+    if (busType != QStringLiteral("Unknown")) physicalDetails += QStringLiteral(" · %1").arg(busType);
+    if (deviceType != QStringLiteral("Unknown")) physicalDetails += QStringLiteral(" · %1").arg(deviceType);
+    if (partition != QStringLiteral("Unknown")) physicalDetails += QStringLiteral("\n%1").arg(partition);
+    m_driveOverviewValues[0]->setText(volumeLabel);
+    m_driveOverviewValues[1]->setText(mount);
+    m_driveOverviewValues[2]->setText(filesystem);
+    m_driveOverviewValues[3]->setText(drive.capacityAvailable ? QStringLiteral("%1 · %2 bytes").arg(formatCapacity(drive)).arg(drive.capacityBytes) : QStringLiteral("Unknown"));
+    m_driveOverviewValues[4]->setText(used);
+    m_driveOverviewValues[5]->setText(QStringLiteral("Total: %1\nAvailable to caller: %2").arg(free,availableToCaller));
+    m_driveOverviewValues[6]->setText(identity);
+    m_driveOverviewValues[7]->setText(physicalDetails);
+
+    RecoverabilityEvidence evidence;
+    evidence.filesystemSupported = supported;
+    evidence.volumeIdentityValidated = result.volumeIdentityValidated &&
+        result.status != FileScanStatus::StaleVolume && !identity.isEmpty() &&
+        volumeIdentity(drive) == m_selectedDeviceIdentity;
+    std::uint64_t chartExisting = 0;
+    std::uint64_t chartDeleted = 0;
+    std::uint64_t chartAmbiguous = 0;
+    std::uint64_t chartInvalid = 0;
+    if (result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial) {
+        evidence.scanState = result.status == FileScanStatus::Success ? AssessmentScanState::Complete : AssessmentScanState::Partial;
+        evidence.filesystemValid = result.status == FileScanStatus::Success;
+        for (const FileEntry& entry : result.entries) {
+            if (entry.status == FileStatus::EXISTING && !entry.isDirectory)
+                ++evidence.existingFileCount;
+            if (entry.status == FileStatus::EXISTING) ++chartExisting;
+            if (entry.status == FileStatus::DELETED) {
+                if (!entry.isDirectory) {
+                    ++evidence.deletedEntryCount;
+                    if (!entry.nameKnown) ++evidence.deletedEntriesWithUnknownName;
+                }
+                if (entry.confidence == FileRecordConfidence::Ambiguous) ++chartAmbiguous;
+                else ++chartDeleted;
+            }
+            if (entry.status == FileStatus::INVALID) { ++evidence.invalidEntryCount; ++chartInvalid; }
+            if (entry.confidence == FileRecordConfidence::Ambiguous) ++evidence.ambiguousEntryCount;
+        }
+    } else if (result.status == FileScanStatus::Cancelled) {
+        evidence.scanState = AssessmentScanState::Cancelled;
+    } else if (result.status == FileScanStatus::Unsupported) {
+        evidence.scanState = AssessmentScanState::Unsupported;
+    } else {
+        evidence.scanState = AssessmentScanState::Failed;
+        evidence.readErrors = result.readError;
+    }
+    const RecoverabilityAssessment assessment = assessRecoverability(evidence);
+    m_assessmentStatus->setText(QString::fromStdString(assessment.title));
+    const QString assessmentColor = assessment.status == AssessmentStatus::PotentialRecoveryEvidenceFound
+        ? QStringLiteral("#66d9e7")
+        : assessment.status == AssessmentStatus::FurtherAnalysisRequired ? QStringLiteral("#f0b36e")
+        : assessment.status == AssessmentStatus::InsufficientEvidence ? QStringLiteral("#a9bdd0")
+        : QStringLiteral("#e98a9e");
+    m_assessmentStatus->setStyleSheet(QStringLiteral("color:%1; background:rgba(31,45,62,165); border:1px solid rgba(105,144,174,75); border-radius:9px; padding:7px 10px; font-size:14px; font-weight:700;").arg(assessmentColor));
+    m_assessmentExplanation->setText(QString::fromStdString(assessment.explanation));
+    m_assessmentNextSteps->setText(QStringLiteral("Recommended next step: %1").arg(QString::fromStdString(assessment.recommendedNextStep)));
+
+    const QString scanState = result.status == FileScanStatus::Success ? QStringLiteral("Complete (FAT32 metadata enumeration)")
+        : result.status == FileScanStatus::Partial ? QStringLiteral("Partial")
+        : result.status == FileScanStatus::Cancelled ? QStringLiteral("Cancelled")
+        : result.status == FileScanStatus::Unsupported ? QStringLiteral("Unsupported filesystem")
+        : QStringLiteral("Failed");
+    const QString completionLabel = result.status == FileScanStatus::Success ? QStringLiteral("COMPLETE")
+        : result.status == FileScanStatus::Partial ? QStringLiteral("PARTIAL")
+        : result.status == FileScanStatus::Cancelled ? QStringLiteral("CANCELLED")
+        : result.status == FileScanStatus::Unsupported ? QStringLiteral("UNSUPPORTED")
+        : QStringLiteral("FAILED");
+    m_assessmentCompletionBadge->setText(completionLabel);
+    const QString badgeColor = result.status == FileScanStatus::Success ? QStringLiteral("#78dfba")
+        : result.status == FileScanStatus::Partial ? QStringLiteral("#f0c17b")
+        : result.status == FileScanStatus::Unsupported ? QStringLiteral("#a9bdd0")
+        : QStringLiteral("#e98a9e");
+    m_assessmentCompletionBadge->setStyleSheet(QStringLiteral("color:%1; background:rgba(30,48,56,150); border:1px solid rgba(112,160,170,70); border-radius:9px; padding:4px 9px; font-size:9px; font-weight:700; letter-spacing:0.5px;").arg(badgeColor));
+    const QString error = result.errorMessage.empty() ? QStringLiteral("None reported") : QString::fromStdString(result.errorMessage);
+    const bool countsAvailable = result.status == FileScanStatus::Success || result.status == FileScanStatus::Partial;
+    const QString existingCount = countsAvailable ? QString::number(evidence.existingFileCount) : QStringLiteral("Unavailable");
+    const QString deletedCount = countsAvailable ? QString::number(evidence.deletedEntryCount) : QStringLiteral("Unavailable");
+    const QString invalidCount = countsAvailable ? QString::number(evidence.invalidEntryCount) : QStringLiteral("Unavailable");
+    const QString ambiguousCount = countsAvailable ? QString::number(evidence.ambiguousEntryCount) : QStringLiteral("Unavailable");
+    const QString unknownNameCount = countsAvailable ? QString::number(evidence.deletedEntriesWithUnknownName) : QStringLiteral("Unavailable");
+    const QString readErrorState = result.readError ? QStringLiteral("Detected") : QStringLiteral("None reported");
+    m_assessmentMetricValues[0]->setText(existingCount);
+    m_assessmentMetricValues[1]->setText(deletedCount);
+    m_evidenceBreakdown->setCounts(chartExisting,chartDeleted,chartAmbiguous,chartInvalid,countsAvailable);
+    if (countsAvailable) {
+        std::vector<FileEntry> displayEntries;
+        displayEntries.reserve(result.entries.size());
+        for (const FileEntry& entry : result.entries) {
+            if (entry.isDirectory || (entry.status != FileStatus::EXISTING && entry.status != FileStatus::DELETED))
+                continue;
+            displayEntries.push_back(entry);
+        }
+        m_dashboardFileModel->setEntries(std::move(displayEntries));
+    }
+    if (!countsAvailable) {
+        m_dashboardFileStatus->setText(QStringLiteral("File records unavailable · Completion: %1 · %2").arg(scanState,error));
+    } else if (m_dashboardFileModel->rowCount() == 0) {
+        m_dashboardFileStatus->setText(QStringLiteral("No file records were identified for this scan · Completion: %1").arg(scanState));
+    } else {
+        m_dashboardFileStatus->setText(QStringLiteral("Existing files enumerated: %1 · Deleted entries identified: %2 · %3 file record(s) · Completion: %4. Deleted candidates are not confirmed recoverable files.")
+                                           .arg(existingCount,deletedCount).arg(m_dashboardFileModel->rowCount()).arg(scanState));
+    }
+    const QString filesystemValidity = evidence.filesystemValid ? QStringLiteral("valid FAT32 metadata")
+        : supported ? QStringLiteral("not verified") : QStringLiteral("unsupported");
+    const QString identityValidity = evidence.volumeIdentityValidated ? QStringLiteral("validated snapshot") : QStringLiteral("unavailable or stale");
+    const QString physicalMetadata = drive.partitionInfoAvailable || !drive.physicalDiskNumber.empty()
+        ? QStringLiteral("available where reported; see Drive Overview") : QStringLiteral("unavailable");
+    m_assessmentIndicators->setText(QStringLiteral("Filesystem support and validity: %1 · %2\nSelected volume identity: %3\nPhysical disk/partition metadata: %4\nScan completeness: %5\nDeleted-entry names unavailable: %6\nInvalid records: %7\nAmbiguous or potentially reused starting clusters: %8\n\nLimitations: FAT32 only; deleted directories are not traversed; hidden-file counts and file-content recoverability are not assessed. A zero deleted-entry count does not prove that no deleted files exist.")
+        .arg(filesystem,filesystemValidity,identityValidity,physicalMetadata,scanState,unknownNameCount,invalidCount,ambiguousCount));
+    m_dashboardStates->setCurrentIndex(5);
+    m_fileScanCancelled.reset();
+}
+
 void MainWindow::startDeviceScan()
 {
-    if (m_deviceScanInProgress)
+    if (m_deviceScanInProgress || m_fileScanInProgress)
         return;
 
     m_deviceScanInProgress = true;
@@ -649,6 +1224,9 @@ void MainWindow::startDeviceScan()
         m_scanButton->setText(QStringLiteral("Scanning…"));
     }
     m_dashboardStates->setCurrentIndex(1);
+    m_progressStatusLabel->setText(QStringLiteral("Scanning for connected devices…"));
+    m_progressDetailLabel->setText(QStringLiteral("Connected removable storage volumes are being checked. This read-only check does not modify their contents."));
+    m_assessmentCancelButton->hide();
     m_scanAnimation->start();
 
     auto result = std::make_shared<DeviceEnumerationResult>();
@@ -689,6 +1267,8 @@ void MainWindow::stopScanAnimation()
 
 void MainWindow::displayDeviceResults(const DeviceEnumerationResult& result)
 {
+    m_selectedDeviceIdentity.clear();
+    m_hasSelectedDrive = false;
     if (!result.success) {
         m_scanDetailLabel->setText(QString::fromStdString(result.errorMessage));
         m_dashboardStates->setCurrentIndex(4);
@@ -745,6 +1325,7 @@ void MainWindow::selectDeviceRow(int row)
         m_selectedDevicePanel->hide();
         m_selectionPrompt->show();
         m_selectedDeviceIdentity.clear();
+        m_hasSelectedDrive = false;
         return;
     }
 
@@ -757,6 +1338,7 @@ void MainWindow::selectDeviceRow(int row)
                 m_selectionPrompt->setText(QStringLiteral("The volume identifier is ambiguous. Rescan before continuing."));
                 m_selectionPrompt->show();
                 m_selectedDeviceIdentity.clear();
+                m_hasSelectedDrive = false;
                 return;
             }
             matchingIndex = static_cast<int>(index);
@@ -767,12 +1349,28 @@ void MainWindow::selectDeviceRow(int row)
         m_selectionPrompt->setText(QStringLiteral("This volume has no unique verified identifier. Rescan before continuing."));
         m_selectionPrompt->show();
         m_selectedDeviceIdentity.clear();
+        m_hasSelectedDrive = false;
         return;
     }
     m_selectedDeviceIdentity = identity;
     const DriveInfo& device = m_detectedDevices[static_cast<std::size_t>(matchingIndex)];
     m_selectedDriveInfo = device;
     m_hasSelectedDrive = true;
+    if (m_dashboardFileModel) m_dashboardFileModel->setEntries({});
+    if (m_dashboardFileStatus)
+        m_dashboardFileStatus->setText(QStringLiteral("Run a supported FAT32 scan to list records for this selected volume."));
+    for (QLabel* metric : m_assessmentMetricValues) if (metric) metric->setText(QStringLiteral("—"));
+    if (m_evidenceBreakdown) m_evidenceBreakdown->setCounts(0,0,0,0,false);
+    if (m_assessmentStatus) m_assessmentStatus->setText(QStringLiteral("Assessment Incomplete"));
+    if (m_assessmentExplanation) m_assessmentExplanation->clear();
+    if (m_assessmentNextSteps) m_assessmentNextSteps->clear();
+    if (m_assessmentIndicators)
+        m_assessmentIndicators->setText(QStringLiteral("The selected drive has not been assessed."));
+    if (m_assessmentCompletionBadge) m_assessmentCompletionBadge->setText(QStringLiteral("NOT SCANNED"));
+    if (m_dashboardFileProxy) {
+        m_fileSearch->clear();
+        m_fileFilter->setCurrentIndex(0);
+    }
     const QString mount = metadataValue(device.mountPoint);
     const QString fileSystem = metadataValue(device.fileSystem);
     const QString available = device.availableBytesAvailable

@@ -26,6 +26,7 @@ public:
     std::vector<std::uint8_t> image;
     bool stale = false;
     bool shortRead = false;
+    bool failRead = false;
     unsigned int validations = 0;
     unsigned int staleOnValidation = 0;
     std::uint64_t declaredSize = 0;
@@ -39,6 +40,7 @@ public:
         return true;
     }
     bool readAt(std::uint64_t offset, std::uint32_t length, std::vector<std::uint8_t>& out, std::string& error) override {
+        if (failRead) { error = "synthetic reader error"; return false; }
         if (offset > image.size() || length > image.size() - offset) { error = "out of bounds"; return false; }
         const std::size_t amount = shortRead && length ? length - 1 : length;
         out.assign(image.begin() + static_cast<std::ptrdiff_t>(offset), image.begin() + static_cast<std::ptrdiff_t>(offset + amount));
@@ -70,14 +72,14 @@ static std::shared_ptr<FakeVolume> makeImage() {
     auto& b=v->image;
     put16(b,11,BPS); b[13]=1; put16(b,14,FAT_START_SECTOR); b[16]=2;
     put16(b,17,0); put16(b,19,0); put16(b,22,0); put32(b,32,TOTAL_SECTORS); put32(b,36,FAT_SECTORS); put16(b,42,0); put32(b,44,2); b[510]=0x55; b[511]=0xAA;
-    for (std::uint32_t c=2;c<=6;++c)setFat(*v,c,0x0FFFFFFF);
+    for (std::uint32_t c=2;c<=7;++c)setFat(*v,c,0x0FFFFFFF);
     auto root=clusterOffset(2);
     writeShort(b,root,"DELETED TXT",0x20,3,500,true);
     writeShort(b,root+32,"SAME    TXT",0x20,4,3);
     writeShort(b,root+64,"SUBDIR     ",0x10,5,0);
     b[root+96]=0;
     auto sub=clusterOffset(5);
-    writeShort(b,sub,"SAME    TXT",0x20,3,11,true);
+    writeShort(b,sub,"SAME    TXT",0x20,7,11,true);
     writeShort(b,sub+32,"SAME    TXT",0x20,6,11);
     b[sub+64]=0;
     return v;
@@ -112,11 +114,12 @@ int main()
     auto image=makeImage();
     auto parsed=scan(image);
     assert(parsed.status==FileScanStatus::Success && parsed.entries.size()==5);
+    assert(parsed.volumeIdentityValidated);
     int deletedCount=0, existingCount=0; std::set<std::string> identities; bool nested=false;
     for(const auto& entry:parsed.entries) {
         assert(entry.entryIdentityAvailable && !entry.identity.empty() && !entry.operationEligible);
         identities.insert(entry.identity);
-        if(entry.status==FileStatus::DELETED) { ++deletedCount; assert(!entry.nameKnown); assert(entry.confidence==FileRecordConfidence::Ambiguous); }
+        if(entry.status==FileStatus::DELETED) { ++deletedCount; assert(!entry.nameKnown); assert(entry.confidence==FileRecordConfidence::Candidate); }
         if(entry.status==FileStatus::EXISTING) ++existingCount;
         if(entry.status==FileStatus::DELETED && entry.parentDirectoryCluster==5) { nested=true; assert(entry.parentPath=="SUBDIR"); }
     }
@@ -152,14 +155,28 @@ int main()
     assert(malformedResult.status==FileScanStatus::Success && malformedResult.entries.size()==1);
     assert(malformedResult.entries.front().status==FileStatus::INVALID);
 
-    auto stale=makeImage(); stale->stale=true; assert(scan(stale).status==FileScanStatus::StaleVolume);
+    auto stale=makeImage(); stale->stale=true; auto staleResult=scan(stale);
+    assert(staleResult.status==FileScanStatus::StaleVolume && !staleResult.volumeIdentityValidated);
     auto disconnectDuringRead=makeImage(); disconnectDuringRead->staleOnValidation=3;
-    assert(scan(disconnectDuringRead).status==FileScanStatus::StaleVolume);
-    auto shortRead=makeImage(); shortRead->shortRead=true; assert(scan(shortRead).status==FileScanStatus::Error);
+    auto disconnectedResult=scan(disconnectDuringRead);
+    assert(disconnectedResult.status==FileScanStatus::StaleVolume && !disconnectedResult.volumeIdentityValidated);
+    auto shortRead=makeImage(); shortRead->shortRead=true; auto shortReadResult=scan(shortRead);
+    assert(shortReadResult.status==FileScanStatus::Error && shortReadResult.readError);
     auto cancelled=makeImage(); assert(scan(cancelled,[](){return true;}).status==FileScanStatus::Cancelled);
     auto midCancel=makeImage(); int cancelChecks=0;
     assert(scan(midCancel,[&cancelChecks](){return ++cancelChecks>=3;}).status==FileScanStatus::Cancelled);
     auto outOfBounds=makeImage(); outOfBounds->declaredSize=BPS; assert(scan(outOfBounds).status==FileScanStatus::Error);
+    auto declaredTooSmall=makeImage(); declaredTooSmall->declaredSize=declaredTooSmall->image.size()-BPS;
+    const auto sizeMismatch=scan(declaredTooSmall);
+    assert(sizeMismatch.status==FileScanStatus::Error && sizeMismatch.errorMessage.find("BPB volume length")!=std::string::npos);
+    auto badBpbSector=makeImage(); put16(badBpbSector->image,11,1024); assert(scan(badBpbSector).status==FileScanStatus::Error);
+    auto badClusterSize=makeImage(); badClusterSize->image[13]=3; assert(scan(badClusterSize).status==FileScanStatus::Error);
+    auto fatBeyondData=makeImage(); put32(fatBeyondData->image,36,TOTAL_SECTORS); assert(scan(fatBeyondData).status==FileScanStatus::Error);
+    auto invalidRoot=makeImage(); put32(invalidRoot->image,44,0x0FFFFFFF); assert(scan(invalidRoot).status==FileScanStatus::Error);
+    auto truncatedBoot=makeImage(); truncatedBoot->image.resize(128); assert(scan(truncatedBoot).status==FileScanStatus::Error);
+    auto readerError=makeImage(); readerError->failRead=true;
+    const auto readerErrorResult=scan(readerError);
+    assert(readerErrorResult.status==FileScanStatus::Error && readerErrorResult.readError);
     auto overflow=makeImage(); put32(overflow->image,32,0xFFFFFFFFU); assert(scan(overflow).status==FileScanStatus::Error);
     auto wrongFilesystem=makeImage(); wrongFilesystem->fs="exFAT"; assert(scan(wrongFilesystem).status==FileScanStatus::Unsupported);
     auto badSector=makeImage(); badSector->sector=0; assert(scan(badSector).status==FileScanStatus::Error);

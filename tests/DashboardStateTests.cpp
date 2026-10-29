@@ -2,14 +2,18 @@
 
 #include <QApplication>
 #include <QAbstractAnimation>
+#include <QComboBox>
 #include <QEventLoop>
+#include <QFrame>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QStackedWidget>
 #include <QTimer>
 #include <QToolButton>
+#include <QTableView>
 #include <QThread>
 #include <cassert>
 #include <algorithm>
@@ -23,6 +27,7 @@ public:
         auto* states = window.findChild<QStackedWidget*>(QStringLiteral("dashboardStates"));
         assert(states);
         assert(states->currentIndex() == 0); // Initial connect state.
+        assert(states->count() == 6); // The last dashboard state is the drive-level assessment.
 
         auto completeControlledScan = [&window, states](const DeviceEnumerationResult& result, int expectedPage) {
             window.m_deviceScanInProgress = true;
@@ -112,10 +117,123 @@ public:
         assert(states->currentIndex() == 4); // Error state, separate from empty.
         assert(window.m_scanDetailLabel->text().contains(QStringLiteral("Test enumeration failure")));
 
+        window.displayDeviceResults(found);
+        window.selectDeviceRow(1);
+        assert(window.m_selectedDeviceIdentity==QStringLiteral("\\\\?\\volume{second-guid}\\"));
+        assert(window.m_nextStepButton && window.m_nextStepButton->text()==QStringLiteral("Next Step"));
+        DriveInfo assessmentDrive=window.m_selectedDriveInfo;
+        assessmentDrive.fileSystem="FAT32";
+        FileScanResult identified;
+        identified.status=FileScanStatus::Success;
+        identified.volumeIdentityValidated=true;
+        FileEntry existingEntry; existingEntry.status=FileStatus::EXISTING; existingEntry.isDirectory=false;
+        existingEntry.name="existing.txt"; existingEntry.nameKnown=true; existingEntry.fullPath="Docs\\existing.txt";
+        existingEntry.sizeBytes=17; existingEntry.sizeKnown=true;
+        FileEntry deletedEntry; deletedEntry.status=FileStatus::DELETED; deletedEntry.confidence=FileRecordConfidence::Candidate;
+        deletedEntry.nameKnown=false; deletedEntry.parentPathKnown=true; deletedEntry.parentPath="Archive";
+        identified.entries={existingEntry,deletedEntry};
+        window.m_assessmentInProgress=true;
+        window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.m_nextStepButton->setEnabled(false);
+        window.completeDriveAssessment(identified,assessmentDrive);
+        assert(!window.m_assessmentInProgress && !window.m_fileScanInProgress);
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        assert(states->currentIndex()==5);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Potential Recovery Evidence Found"));
+        assert(window.m_assessmentSummary->text().contains(QStringLiteral("Existing files enumerated: 1")));
+        assert(window.m_assessmentSummary->text().contains(QStringLiteral("Deleted entries identified: 1")));
+        auto* fileTable=window.findChild<QTableView*>(QStringLiteral("dashboardFileTable"));
+        auto* fileSearch=window.findChild<QLineEdit*>(QStringLiteral("dashboardFileSearch"));
+        auto* fileFilter=window.findChild<QComboBox*>(QStringLiteral("dashboardFileFilter"));
+        auto* fileSection=window.findChild<QFrame*>(QStringLiteral("dashboardFilesOnDrive"));
+        assert(fileTable && fileSearch && fileFilter && fileSection);
+        assert(fileTable->model()->columnCount()==4 && fileTable->model()->rowCount()==2);
+        assert(fileTable->model()->index(0,0).data().toString()==QStringLiteral("existing.txt"));
+        assert(fileTable->model()->index(0,1).data().toString()==QStringLiteral("Docs\\existing.txt"));
+        assert(fileTable->model()->index(0,2).data().toString()==QStringLiteral("17 bytes"));
+        assert(fileTable->model()->index(0,3).data().toString()==QStringLiteral("Existing"));
+        assert(fileTable->model()->index(1,0).data().toString()==QStringLiteral("Unavailable"));
+        assert(fileTable->model()->index(1,1).data().toString()==QStringLiteral("Archive"));
+        assert(fileTable->model()->index(1,3).data().toString()==QStringLiteral("Deleted candidate"));
+        fileFilter->setCurrentIndex(1); assert(fileTable->model()->rowCount()==1);
+        fileFilter->setCurrentIndex(2); assert(fileTable->model()->rowCount()==1);
+        fileFilter->setCurrentIndex(0); fileSearch->setText(QStringLiteral("not-present"));
+        assert(fileTable->model()->rowCount()==0);
+        fileSearch->clear(); assert(fileTable->model()->rowCount()==2);
+
+        FileScanResult noDeleted; noDeleted.status=FileScanStatus::Success; noDeleted.volumeIdentityValidated=true; noDeleted.entries={existingEntry};
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.completeDriveAssessment(noDeleted,assessmentDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Insufficient Evidence"));
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        assert(fileTable->model()->rowCount()==1);
+        FileScanResult emptyResult; emptyResult.status=FileScanStatus::Success; emptyResult.volumeIdentityValidated=true;
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.completeDriveAssessment(emptyResult,assessmentDrive);
+        assert(fileTable->model()->rowCount()==0);
+        assert(window.m_dashboardFileStatus->text().contains(QStringLiteral("No file records")));
+        FileScanResult partial; partial.status=FileScanStatus::Partial;
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.completeDriveAssessment(partial,assessmentDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Assessment Incomplete"));
+        assert(window.m_assessmentSummary->text().contains(QStringLiteral("Partial")));
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        FileScanResult cancelled; cancelled.status=FileScanStatus::Cancelled;
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.completeDriveAssessment(cancelled,assessmentDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Assessment Incomplete"));
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        FileScanResult failed; failed.status=FileScanStatus::Error; failed.errorMessage="synthetic read error";
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.completeDriveAssessment(failed,assessmentDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Assessment Incomplete"));
+        assert(fileTable->model()->rowCount()==0);
+        assert(window.m_dashboardFileStatus->text().contains(QStringLiteral("synthetic read error")));
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        DriveInfo unsupportedDrive=assessmentDrive; unsupportedDrive.fileSystem="exFAT";
+        FileScanResult unsupported; unsupported.status=FileScanStatus::Unsupported;
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.completeDriveAssessment(unsupported,unsupportedDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Assessment Incomplete"));
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        FileScanResult ambiguous; ambiguous.status=FileScanStatus::Success;
+        ambiguous.volumeIdentityValidated=true;
+        FileEntry ambiguousEntry; ambiguousEntry.status=FileStatus::DELETED; ambiguousEntry.confidence=FileRecordConfidence::Ambiguous;
+        ambiguous.entries.push_back(ambiguousEntry);
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.m_scanAnimation->start();
+        window.completeDriveAssessment(ambiguous,assessmentDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Further Analysis Required"));
+        assert(window.m_scanAnimation->state()==QAbstractAnimation::Stopped);
+        window.m_assessmentBackButton->click();
+        assert(states->currentIndex()==2);
+        window.navigateTo(0,QStringLiteral("Dashboard"));
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.startDriveAssessment(); // Duplicate requests do not create another worker.
+        assert(!window.m_fileScanThread);
+        window.m_assessmentInProgress=false; window.m_fileScanInProgress=false;
+        window.m_selectedDeviceIdentity=QStringLiteral("stale-volume-id");
+        window.m_assessmentInProgress=true; window.m_fileScanInProgress=true;
+        window.completeDriveAssessment(identified,assessmentDrive);
+        assert(window.m_assessmentStatus->text()==QStringLiteral("Assessment Incomplete"));
+
         window.resize(1240, 820);
         window.show();
         QApplication::processEvents();
         assert(window.width() >= 960 && window.height() >= 640);
+        auto* overviewCard=window.findChild<QFrame*>(QStringLiteral("assessmentDriveOverview"));
+        auto* summaryCard=window.findChild<QFrame*>(QStringLiteral("assessmentScanSummary"));
+        auto* indicatorsCard=window.findChild<QFrame*>(QStringLiteral("recoverabilityIndicators"));
+        auto* resultCard=window.findChild<QFrame*>(QStringLiteral("assessmentResult"));
+        assert(overviewCard && summaryCard && indicatorsCard && resultCard && fileSection);
+        assert(overviewCard->y()<summaryCard->y() && summaryCard->y()<fileSection->y() && fileSection->y()<indicatorsCard->y());
+        assert(indicatorsCard->x()<resultCard->x());
         window.resize(960, 640);
         QApplication::processEvents();
         assert(states->width() > 0 && states->height() > 0);

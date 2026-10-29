@@ -180,6 +180,8 @@ DeviceEnumerationResult DeviceManager::enumerateRemovableDrives() const {
                 info.capacityAvailable = true;
                 info.availableBytes = availableBytes.QuadPart;
                 info.availableBytesAvailable = true;
+                info.totalFreeBytes = totalFreeBytes.QuadPart;
+                info.totalFreeBytesAvailable = true;
             }
             DWORD sectorsPerCluster = 0;
             DWORD bytesPerSector = 0;

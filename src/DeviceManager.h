@@ -13,6 +13,8 @@ struct DriveInfo {
     unsigned int logicalSectorSize = 0;
     unsigned long long availableBytes = 0;
     bool availableBytesAvailable = false;
+    unsigned long long totalFreeBytes = 0;
+    bool totalFreeBytesAvailable = false;
     std::string deviceType;
     std::string physicalDiskNumber;
     std::string deviceModel;
