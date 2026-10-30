@@ -4,3 +4,4 @@ build/
 *.obj
 .cmake/
 CMakeFiles/
+/data/recoverability_assessment.json

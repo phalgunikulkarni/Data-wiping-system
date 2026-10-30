@@ -30,6 +30,9 @@ public:
     unsigned int validations = 0;
     unsigned int staleOnValidation = 0;
     std::uint64_t declaredSize = 0;
+    std::uint64_t readAtCalls = 0;
+    std::uint64_t bytesRead = 0;
+    std::uint32_t maximumReadRequest = 0;
     std::string volumeIdentity() const override { return id; }
     std::string fileSystem() const override { return fs; }
     std::uint64_t sizeBytes() const override { return declaredSize ? declaredSize : image.size(); }
@@ -40,9 +43,12 @@ public:
         return true;
     }
     bool readAt(std::uint64_t offset, std::uint32_t length, std::vector<std::uint8_t>& out, std::string& error) override {
+        ++readAtCalls;
+        maximumReadRequest=std::max(maximumReadRequest,length);
         if (failRead) { error = "synthetic reader error"; return false; }
         if (offset > image.size() || length > image.size() - offset) { error = "out of bounds"; return false; }
         const std::size_t amount = shortRead && length ? length - 1 : length;
+        bytesRead+=amount;
         out.assign(image.begin() + static_cast<std::ptrdiff_t>(offset), image.begin() + static_cast<std::ptrdiff_t>(offset + amount));
         return true;
     }
@@ -82,6 +88,27 @@ static std::shared_ptr<FakeVolume> makeImage() {
     writeShort(b,sub,"SAME    TXT",0x20,7,11,true);
     writeShort(b,sub+32,"SAME    TXT",0x20,6,11);
     b[sub+64]=0;
+    return v;
+}
+static std::shared_ptr<FakeVolume> makeManyDirectoryImage(std::uint32_t directoryCount,std::uint32_t clusterSpacing=1)
+{
+    auto v=makeImage();
+    const std::uint32_t rootClusters=(directoryCount+15)/16+1;
+    for (std::uint32_t c=2;c<2+rootClusters;++c) {
+        const std::uint32_t next=c+1<2+rootClusters ? c+1 : 0x0FFFFFFF;
+        setFat(*v,c,next);
+        std::fill(v->image.begin()+clusterOffset(c),v->image.begin()+clusterOffset(c)+BPS,0);
+    }
+    for (std::uint32_t i=0;i<directoryCount;++i) {
+        const std::uint32_t directoryCluster=1024+i*clusterSpacing;
+        setFat(*v,directoryCluster,0x0FFFFFFF);
+        std::fill(v->image.begin()+clusterOffset(directoryCluster),v->image.begin()+clusterOffset(directoryCluster)+BPS,0);
+        const std::uint32_t rootSlot=i;
+        const std::uint32_t rootCluster=2+rootSlot/16;
+        const std::uint32_t slot=rootSlot%16;
+        const std::string name="DIR"+std::to_string(100000+i);
+        writeShort(v->image,clusterOffset(rootCluster)+slot*32,name,0x10,directoryCluster,0);
+    }
     return v;
 }
 static FileScanResult scan(const std::shared_ptr<FakeVolume>& image, FileScanner::CancellationCheck cancel = {}) {
@@ -147,6 +174,82 @@ int main()
     std::set<std::string> samePaths;
     for(const auto& entry:parsed.entries) if(entry.status==FileStatus::EXISTING && entry.name=="SAME.TXT") { ++namedSame; samePaths.insert(entry.fullPath); }
     assert(namedSame==2 && samePaths.size()==2);
+
+    // One FAT32 long-name slot at the last slot of one directory cluster and
+    // its short entry at the first slot of the next cluster remain one record.
+    auto boundaryLfn=makeImage();
+    auto& boundaryBytes=boundaryLfn->image;
+    setFat(*boundaryLfn,2,3); setFat(*boundaryLfn,3,0x0FFFFFFF);
+    std::fill(boundaryBytes.begin()+clusterOffset(2),boundaryBytes.begin()+clusterOffset(2)+BPS,0);
+    std::fill(boundaryBytes.begin()+clusterOffset(3),boundaryBytes.begin()+clusterOffset(3)+BPS,0);
+    for (std::uint32_t slot=0;slot<15;++slot)
+        writeShort(boundaryBytes,clusterOffset(2)+slot*32,"DEL0000000",0x20,0,0,true);
+    const std::size_t lfnOffset=clusterOffset(2)+15*32;
+    const std::string boundaryShortName="ACROSS~1TXT";
+    const std::string boundaryLongName="Across.txt";
+    boundaryBytes[lfnOffset]=0x41; boundaryBytes[lfnOffset+11]=0x0F; boundaryBytes[lfnOffset+12]=0;
+    boundaryBytes[lfnOffset+13]=shortChecksum(reinterpret_cast<const std::uint8_t*>(boundaryShortName.data()));
+    const int lfnPositions[]={1,3,5,7,9,14,16,18,20,22,24,28,30};
+    for (int i=0;i<13;++i) put16(boundaryBytes,lfnOffset+lfnPositions[i],
+        i<static_cast<int>(boundaryLongName.size()) ? static_cast<unsigned char>(boundaryLongName[static_cast<std::size_t>(i)])
+        : (i==static_cast<int>(boundaryLongName.size()) ? 0 : 0xFFFF));
+    writeShort(boundaryBytes,clusterOffset(3),boundaryShortName,0x20,4,5);
+    boundaryBytes[clusterOffset(3)+32]=0;
+    const auto boundaryResult=scan(boundaryLfn);
+    assert(boundaryResult.status==FileScanStatus::Success && boundaryResult.entries.size()==16);
+    bool foundBoundaryName=false;
+    for (const auto& entry:boundaryResult.entries)
+        if (entry.name==boundaryLongName && entry.status==FileStatus::EXISTING) foundBoundaryName=true;
+    assert(foundBoundaryName);
+    assert(boundaryLfn->readAtCalls==3); // Boot, one FAT sector, and one coalesced two-cluster directory read.
+
+    // The valid BPB uses sector-aligned 32-bit FAT entries, so a FAT entry
+    // cannot straddle a 512-byte boundary. Adjacent entries on opposite sides
+    // of that boundary still cause separate bounded cache misses.
+    auto fatBoundary=makeImage();
+    put32(fatBoundary->image,44,127);
+    setFat(*fatBoundary,127,128); setFat(*fatBoundary,128,0x0FFFFFFF);
+    std::fill(fatBoundary->image.begin()+clusterOffset(127),fatBoundary->image.begin()+clusterOffset(127)+BPS,0);
+    std::fill(fatBoundary->image.begin()+clusterOffset(128),fatBoundary->image.begin()+clusterOffset(128)+BPS,0);
+    for (std::uint32_t slot=0;slot<16;++slot)
+        writeShort(fatBoundary->image,clusterOffset(127)+slot*32,"DEL0000000",0x20,0,0,true);
+    const auto fatBoundaryResult=scan(fatBoundary);
+    assert(fatBoundaryResult.status==FileScanStatus::Success && fatBoundaryResult.entries.size()==16);
+    assert(fatBoundary->readAtCalls==4); // Boot, two adjacent FAT sectors, one coalesced directory range.
+
+    // Counting-reader benchmark: many directory chains revisit nearby FAT
+    // entries, while adjacent root clusters can be read in one bounded request.
+    auto benchmarkImage=makeManyDirectoryImage(250);
+    const auto benchmarkResult=scan(benchmarkImage);
+    assert(benchmarkResult.status==FileScanStatus::Success && benchmarkResult.entries.size()==250);
+    const std::uint64_t benchmarkRootClusters=(250+15)/16+1;
+    const std::uint64_t baselineFatReads=benchmarkRootClusters+500; // Root chain and two walks per child directory.
+    const std::uint64_t baselineDirectoryReads=benchmarkRootClusters+250;
+    const std::uint64_t estimatedUncachedCalls=1+baselineFatReads+baselineDirectoryReads;
+    const std::uint64_t estimatedUncachedBytes=BPS+baselineFatReads*4+baselineDirectoryReads*BPS;
+    std::cout << "Synthetic FAT32 I/O benchmark: readAt calls optimized=" << benchmarkImage->readAtCalls
+              << ", estimated uncached=" << estimatedUncachedCalls
+              << "; bytes optimized=" << benchmarkImage->bytesRead
+              << ", estimated uncached=" << estimatedUncachedBytes << '\n';
+    assert(benchmarkImage->readAtCalls<estimatedUncachedCalls);
+    assert(benchmarkImage->bytesRead<estimatedUncachedBytes);
+    assert(benchmarkImage->maximumReadRequest<=1024*1024);
+    const std::uint64_t firstScanCalls=benchmarkImage->readAtCalls;
+    const std::uint64_t firstScanBytes=benchmarkImage->bytesRead;
+    const auto resetResult=scan(benchmarkImage);
+    assert(resetResult.status==FileScanStatus::Success && resetResult.entries.size()==250);
+    assert(benchmarkImage->readAtCalls-firstScanCalls==firstScanCalls);
+    assert(benchmarkImage->bytesRead-firstScanBytes==firstScanBytes);
+
+    // A wider working set crosses the 64 KiB FAT-sector cache capacity. Scan
+    // remains bounded, succeeds, and batches no directory read above 1 MiB.
+    auto boundedCacheImage=makeManyDirectoryImage(300,64);
+    const auto boundedCacheResult=scan(boundedCacheImage);
+    assert(boundedCacheResult.status==FileScanStatus::Success && boundedCacheResult.entries.size()==300);
+    assert(boundedCacheImage->maximumReadRequest<=1024*1024);
+    // The directory workload touches more than 128 distinct 512-byte FAT
+    // sectors; a 64 KiB cache therefore evicts and later rereads some sectors.
+    assert(boundedCacheImage->readAtCalls>453);
 
     auto longNameImage=makeImage();
     const std::size_t rootOffset=clusterOffset(2);

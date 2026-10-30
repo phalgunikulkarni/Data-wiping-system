@@ -19,10 +19,12 @@ add_executable(WipeEngine WIN32
     src/FileScanner.cpp
     src/Fat32Scanner.cpp
     src/RecoverabilityAssessment.cpp
+    src/AssessmentPersistence.cpp
     src/Logger.cpp
     src/CertificateGenerator.cpp
     src/FeatureExtractor.cpp
     src/RandomForest.cpp
+    src/RegularImageWorkspace.cpp
     src/AuthWindow.cpp
     src/AuthService.cpp
     src/DatabaseManager.cpp
@@ -51,6 +53,7 @@ if(BUILD_TESTING)
         src/DeviceManager.cpp
         src/Fat32Scanner.cpp
         src/RecoverabilityAssessment.cpp
+        src/AssessmentPersistence.cpp
         src/ImageBackgroundWidget.cpp
         resources.qrc
     )
@@ -86,4 +89,19 @@ if(BUILD_TESTING)
         src/RecoverabilityAssessment.cpp
     )
     add_test(NAME RecoverabilityAssessmentTests COMMAND RecoverabilityAssessmentTests)
+
+    add_executable(AssessmentPersistenceTests
+        tests/AssessmentPersistenceTests.cpp
+        src/AssessmentPersistence.cpp
+        src/RecoverabilityAssessment.cpp
+    )
+    target_link_libraries(AssessmentPersistenceTests PRIVATE Qt6::Core)
+    add_test(NAME AssessmentPersistenceTests COMMAND AssessmentPersistenceTests)
+
+    add_executable(RegularImageWorkspaceTests
+        tests/RegularImageWorkspaceTests.cpp
+        src/RegularImageWorkspace.cpp
+    )
+    target_link_libraries(RegularImageWorkspaceTests PRIVATE Qt6::Core)
+    add_test(NAME RegularImageWorkspaceTests COMMAND RegularImageWorkspaceTests)
 endif()

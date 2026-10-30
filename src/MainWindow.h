@@ -3,6 +3,7 @@
 #include "DeviceManager.h"
 #include "FileScanner.h"
 #include "RecoverabilityAssessment.h"
+#include "AssessmentPersistence.h"
 
 #include <QMainWindow>
 #include <QString>
@@ -20,7 +21,6 @@ class QStackedWidget;
 class QThread;
 class QToolButton;
 class QFrame;
-class EvidenceBreakdownWidget;
 class QLineEdit;
 class QComboBox;
 class QTableView;
@@ -39,8 +39,11 @@ signals:
     void signOutRequested();
 
 private:
+    enum class FileSelectionMode { None, RecoverCandidates, SecureWipeReview };
     QWidget* buildDashboardPage();
     QWidget* buildDashboardAssessmentPage();
+    QWidget* buildDeviceInformationPage();
+    QWidget* buildUnavailableOperationPage();
     QWidget* buildDevicesPage();
     QWidget* buildScanResultsPage();
     QWidget* buildOperationsPage();
@@ -56,8 +59,15 @@ private:
     void startDeletedEntryScan();
     void completeDeletedEntryScan(const FileScanResult& result, const QString& sourceVolume,
                                   const QString& expectedVolumeIdentity);
-    void startDriveAssessment();
+    void displayScanResultsEntries(const std::vector<FileEntry>& entries, const QString& sourceVolume,
+                                   const QString& statusText, const QString& errorText = {});
+    void startDriveAssessment(bool forceNewAssessment = false);
     void completeDriveAssessment(const FileScanResult& result, const DriveInfo& drive);
+    void displaySavedAssessment(const StoredRecoverabilityAssessment& saved, const DriveInfo& currentDevice);
+    void showDeviceInformation();
+    void openFileSelection(FileSelectionMode mode);
+    void updateFileSelectionReview();
+    void updateDriveOverview(const DriveInfo& drive);
     void launchFat32Scan(const DriveInfo& drive, std::function<void(const FileScanResult&)> completion);
 
     QString m_signedInUser;
@@ -84,16 +94,25 @@ private:
     QPushButton* m_fileScanCancelButton = nullptr;
     QPushButton* m_nextStepButton = nullptr;
     QPushButton* m_assessmentRetryButton = nullptr;
+    QPushButton* m_fileListingAssessmentButton = nullptr;
     QPushButton* m_assessmentBackButton = nullptr;
     QPushButton* m_assessmentCancelButton = nullptr;
     QLabel* m_fileScanStatus = nullptr;
     QLabel* m_fileScanSource = nullptr;
-    QLabel* m_assessmentIndicators = nullptr;
+    QLabel* m_assessmentSummary = nullptr;
     QLabel* m_assessmentStatus = nullptr;
-    QLabel* m_assessmentExplanation = nullptr;
-    QLabel* m_assessmentNextSteps = nullptr;
+    QLabel* m_deviceInformationValues = nullptr;
+    QLabel* m_operationTargetLabel = nullptr;
+    QLabel* m_fileSelectionCount = nullptr;
+    QLabel* m_fileSelectionReview = nullptr;
+    QLabel* m_fileSelectionAvailability = nullptr;
+    QPushButton* m_deviceInformationContinueButton = nullptr;
+    QPushButton* m_fileSelectAllButton = nullptr;
+    QPushButton* m_fileClearSelectionButton = nullptr;
+    QPushButton* m_fileOperationUnavailableButton = nullptr;
+    QFrame* m_assessmentSummaryCard = nullptr;
+    FileSelectionMode m_fileSelectionMode = FileSelectionMode::None;
     std::array<QLabel*, 8> m_driveOverviewValues{};
-    EvidenceBreakdownWidget* m_evidenceBreakdown = nullptr;
     QLineEdit* m_fileSearch = nullptr;
     QComboBox* m_fileFilter = nullptr;
     QTableView* m_dashboardFileTable = nullptr;
@@ -111,5 +130,17 @@ private:
     bool m_assessmentInProgress = false;
     bool m_deviceScanInProgress = false;
     std::vector<DriveInfo> m_detectedDevices;
+    // One assessment/scan result is shared by every operation panel for the
+    // currently selected verified volume. The launcher is injectable in UI
+    // tests so they never need to open a mounted volume.
+    std::function<void(const DriveInfo&, std::function<void(const FileScanResult&)>)> m_fat32ScanLauncher;
+    QString m_lastScanIdentity;
+    FileScanResult m_lastScanResult;
+    bool m_lastScanResultAvailable = false;
+    StoredRecoverabilityAssessment m_cachedAssessment;
+    bool m_cachedAssessmentAvailable = false;
+    bool m_returnToDeviceInformationAfterAssessment = false;
+    bool m_scanRequestedFromResults = false;
+    AssessmentPersistence m_assessmentPersistence;
     QVector<QToolButton*> m_navigationButtons;
 };

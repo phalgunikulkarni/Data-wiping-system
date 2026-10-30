@@ -22,6 +22,8 @@ constexpr std::uint32_t kEndOfChain = 0x0FFFFFF8;
 constexpr std::uint32_t kBadCluster = 0x0FFFFFF7;
 constexpr std::uint32_t kReservedClusterStart = 0x0FFFFFF0;
 constexpr std::uint64_t kMaximumClusterBytes = 1024 * 1024;
+constexpr std::uint64_t kMaximumFatCacheBytes = 64 * 1024;
+constexpr std::uint64_t kMaximumCoalescedDirectoryBytes = 1024 * 1024;
 
 std::uint16_t u16(const std::uint8_t* p) { return static_cast<std::uint16_t>(p[0] | (std::uint16_t(p[1]) << 8)); }
 std::uint32_t u32(const std::uint8_t* p) { return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) | (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24); }
@@ -295,12 +297,84 @@ private:
             errorText = "FAT32 cluster-chain entry exceeds the FAT";
             return false;
         }
-        std::uint64_t offset = 0;
-        if (!checkedAdd(geometry.fatOffset, entryOffset, offset)) { errorText = "FAT32 cluster-chain offset overflow"; return false; }
         std::vector<std::uint8_t> raw;
-        if (!read(offset, 4, raw)) return false;
+        if (!readFatBytes(entryOffset, 4, raw)) return false;
         next = u32(raw.data()) & 0x0FFFFFFF;
         return true;
+    }
+
+    bool readFatBytes(std::uint64_t fatRelativeOffset, std::uint32_t length,
+                      std::vector<std::uint8_t>& out)
+    {
+        if (!length || fatRelativeOffset > geometry.fatBytes || length > geometry.fatBytes - fatRelativeOffset) {
+            errorText = "FAT32 cache read exceeds the validated allocation table";
+            return false;
+        }
+        out.clear();
+        out.reserve(length);
+        const std::uint64_t sectorCount = std::max<std::uint64_t>(1, kMaximumFatCacheBytes / sectorSize);
+        const std::uint64_t maxCacheBytes = sectorCount * sectorSize;
+        std::uint64_t remaining = length;
+        std::uint64_t current = fatRelativeOffset;
+        while (remaining) {
+            if (isCancelled()) { errorText = "__CANCELLED__"; return false; }
+            const std::uint64_t sectorIndex = current / sectorSize;
+            std::uint64_t sectorStart = 0;
+            if (!checkedMul(sectorIndex,sectorSize,sectorStart)) {
+                errorText = "FAT32 cache sector arithmetic overflow";
+                return false;
+            }
+            if (sectorStart > geometry.fatBytes || sectorSize > geometry.fatBytes - sectorStart) {
+                errorText = "FAT32 cache sector exceeds the validated allocation table";
+                return false;
+            }
+            auto found = fatSectorCache.find(sectorIndex);
+            if (found == fatSectorCache.end()) {
+                std::uint64_t absoluteOffset = 0;
+                if (!checkedAdd(geometry.fatOffset,sectorStart,absoluteOffset)) {
+                    errorText = "FAT32 cache sector offset overflow";
+                    return false;
+                }
+                std::vector<std::uint8_t> sectorBytes;
+                if (!read(absoluteOffset,sectorSize,sectorBytes)) return false;
+                if (sectorBytes.size()>maxCacheBytes) {
+                    errorText="FAT32 sector exceeds the bounded cache capacity";
+                    return false;
+                }
+                while (fatCacheBytes > maxCacheBytes - sectorBytes.size() && !fatSectorOrder.empty()) {
+                    const std::uint64_t evict = fatSectorOrder.front();
+                    fatSectorOrder.pop_front();
+                    const auto old = fatSectorCache.find(evict);
+                    if (old != fatSectorCache.end()) {
+                        fatCacheBytes -= old->second.size();
+                        fatSectorCache.erase(old);
+                    }
+                }
+                if (!checkedAdd(fatCacheBytes,sectorBytes.size(),fatCacheBytes)) {
+                    errorText="FAT32 cache size arithmetic overflow";
+                    return false;
+                }
+                fatSectorOrder.push_back(sectorIndex);
+                found = fatSectorCache.emplace(sectorIndex,std::move(sectorBytes)).first;
+            } else if (!reader->revalidate(identity,errorText)) {
+                staleVolume = true;
+                return false;
+            }
+            const std::uint64_t within = current - sectorStart;
+            const std::uint64_t amount = std::min<std::uint64_t>(remaining,sectorSize-within);
+            if (within > found->second.size() || amount > found->second.size()-static_cast<std::size_t>(within)) {
+                errorText = "FAT32 cached sector is shorter than the requested metadata";
+                return false;
+            }
+            out.insert(out.end(),found->second.begin()+static_cast<std::ptrdiff_t>(within),
+                       found->second.begin()+static_cast<std::ptrdiff_t>(within+amount));
+            if (!checkedAdd(current,amount,current)) {
+                errorText = "FAT32 cache read offset overflow";
+                return false;
+            }
+            remaining -= amount;
+        }
+        return out.size()==length;
     }
 
     bool collectChain(std::uint32_t start, std::uint64_t bytesNeeded,
@@ -371,36 +445,58 @@ private:
         }
         allocatedClusters.insert(chain.begin(), chain.end());
         bool endOfDirectory = false;
-        for (std::uint32_t cluster : chain) {
+        const std::uint64_t maxRunClusters = std::max<std::uint64_t>(1,kMaximumCoalescedDirectoryBytes / geometry.clusterBytes);
+        for (std::size_t firstIndex=0; firstIndex<chain.size() && !endOfDirectory;) {
             if (isCancelled()) { errorText = "__CANCELLED__"; return; }
-            std::uint64_t offset = 0;
-            if (!clusterOffset(cluster, offset)) { errorText = "Directory cluster offset exceeds volume bounds"; return; }
-            std::vector<std::uint8_t> bytes;
-            if (!read(offset, static_cast<std::uint32_t>(geometry.clusterBytes), bytes)) return;
-            for (std::uint32_t slot = 0; slot < geometry.clusterBytes / 32; ++slot) {
-                const std::uint8_t* raw = bytes.data() + std::size_t(slot) * 32;
-                const std::uint8_t first = raw[0];
-                if (first == 0) { endOfDirectory = true; break; }
-                if (raw[11] == kLongNameAttribute) {
-                    parseLfn(raw);
-                    continue;
-                }
-                const bool deleted = first == kDeleted;
-                if ((!deleted && first == '.') || (raw[11] & 0x08)) { lfnParts.clear(); continue; }
-                if (raw[11] & 0xC0) {
-                    lfnParts.clear();
-                    const std::uint32_t suspiciousCluster = ((std::uint32_t(u16(raw + 20)) << 16) | u16(raw + 26)) & 0x0FFFFFFF;
-                    if (suspiciousCluster >= 2 && suspiciousCluster <= geometry.maximumCluster)
-                        allocatedClusters.insert(suspiciousCluster);
-                    appendInvalid(dir, cluster, slot, "Reserved FAT32 directory attribute bits are set.", deleted);
-                    if (!errorText.empty()) return;
-                    continue;
-                }
-                emitEntry(dir, cluster, slot, raw, deleted);
-                lfnParts.clear();
-                if (!errorText.empty()) return;
+            std::uint64_t runCount=1;
+            while (runCount<static_cast<std::uint64_t>(chain.size()-firstIndex) && runCount<maxRunClusters &&
+                   std::uint64_t(chain[firstIndex+static_cast<std::size_t>(runCount-1)])+1==
+                       chain[firstIndex+static_cast<std::size_t>(runCount)])
+                ++runCount;
+            std::uint64_t runBytes=0, offset=0;
+            if (!checkedMul(runCount,geometry.clusterBytes,runBytes) ||
+                runBytes>kMaximumCoalescedDirectoryBytes || runBytes>std::numeric_limits<std::uint32_t>::max() ||
+                !clusterOffset(chain[firstIndex],offset) || !isValidVolumeReadRange(offset,runBytes,geometry.volumeBytes)) {
+                errorText = "Coalesced directory read exceeds validated FAT32 bounds";
+                return;
             }
-            if (endOfDirectory) break;
+            std::vector<std::uint8_t> bytes;
+            if (!read(offset,static_cast<std::uint32_t>(runBytes),bytes)) return;
+            for (std::uint64_t withinRun=0; withinRun<runCount && !endOfDirectory; ++withinRun) {
+                if (isCancelled()) { errorText="__CANCELLED__"; return; }
+                // Retain the previous per-cluster identity checks even when several
+                // adjacent clusters were fetched by one bounded read.
+                if (runCount>1 && !reader->revalidate(identity,errorText)) { staleVolume=true; return; }
+                const std::uint32_t cluster=chain[firstIndex+static_cast<std::size_t>(withinRun)];
+                std::uint64_t clusterOffsetInRun64=0;
+                if (!checkedMul(withinRun,geometry.clusterBytes,clusterOffsetInRun64) ||
+                    clusterOffsetInRun64>bytes.size() || geometry.clusterBytes>bytes.size()-clusterOffsetInRun64) {
+                    errorText="Coalesced directory cluster offset overflow";
+                    return;
+                }
+                const std::size_t clusterOffsetInRun=static_cast<std::size_t>(clusterOffsetInRun64);
+                const std::uint8_t* clusterData=bytes.data()+clusterOffsetInRun;
+                for (std::uint32_t slot=0; slot<geometry.clusterBytes/32; ++slot) {
+                    const std::uint8_t* raw=clusterData+std::size_t(slot)*32;
+                    const std::uint8_t first=raw[0];
+                    if (first==0) { endOfDirectory=true; break; }
+                    if (raw[11]==kLongNameAttribute) { parseLfn(raw); continue; }
+                    const bool deleted=first==kDeleted;
+                    if ((!deleted && first=='.') || (raw[11]&0x08)) { lfnParts.clear(); continue; }
+                    if (raw[11]&0xC0) {
+                        lfnParts.clear();
+                        const std::uint32_t suspiciousCluster=((std::uint32_t(u16(raw+20))<<16)|u16(raw+26))&0x0FFFFFFF;
+                        if (suspiciousCluster>=2 && suspiciousCluster<=geometry.maximumCluster) allocatedClusters.insert(suspiciousCluster);
+                        appendInvalid(dir,cluster,slot,"Reserved FAT32 directory attribute bits are set.",deleted);
+                        if (!errorText.empty()) return;
+                        continue;
+                    }
+                    emitEntry(dir,cluster,slot,raw,deleted);
+                    lfnParts.clear();
+                    if (!errorText.empty()) return;
+                }
+            }
+            firstIndex+=static_cast<std::size_t>(runCount);
         }
     }
 
@@ -572,6 +668,9 @@ private:
     std::deque<Dir> queue;
     std::unordered_set<std::uint32_t> allocatedClusters;
     std::unordered_map<std::uint32_t, std::vector<std::size_t>> deletedStartClusters;
+    std::unordered_map<std::uint64_t,std::vector<std::uint8_t>> fatSectorCache;
+    std::deque<std::uint64_t> fatSectorOrder;
+    std::uint64_t fatCacheBytes = 0;
 };
 
 class WindowsMountedVolumeReader final : public IReadOnlyVolumeReader {
